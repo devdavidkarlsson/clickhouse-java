@@ -576,14 +576,15 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             QueryResponse response = future.get(5, TimeUnit.SECONDS);
 
             // Now read the stream - NIO thread continues writing while we read
-            java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(response.getInputStream()));
-            long lineCount = 0;
-            while (reader.readLine() != null) {
-                lineCount++;
-            }
+            try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(response.getInputStream()))) {
+                long lineCount = 0;
+                while (reader.readLine() != null) {
+                    lineCount++;
+                }
 
-            Assert.assertEquals(lineCount, 10000, "Expected 10000 rows");
+                Assert.assertEquals(lineCount, 10000, "Expected 10000 rows");
+            }
             response.close();
 
         } catch (Exception e) {
