@@ -4,9 +4,13 @@ import com.clickhouse.client.api.Client;
 import com.clickhouse.client.api.ClientConfigProperties;
 import com.clickhouse.client.api.ClientException;
 import com.clickhouse.client.api.ServerException;
+import com.clickhouse.client.api.data_formats.ClickHouseBinaryFormatReader;
 import com.clickhouse.client.api.enums.Protocol;
+import com.clickhouse.client.api.insert.InsertResponse;
+import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.query.GenericRecord;
 import com.clickhouse.client.api.query.QueryResponse;
+import com.clickhouse.data.ClickHouseFormat;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.WireMock;
 import com.github.tomakehurst.wiremock.common.ConsoleNotifier;
@@ -15,6 +19,9 @@ import org.apache.hc.core5.http.HttpStatus;
 import org.testng.Assert;
 import org.testng.annotations.Test;
 
+import java.io.ByteArrayInputStream;
+import java.nio.charset.StandardCharsets;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Random;
 import java.util.concurrent.CompletableFuture;
@@ -638,6 +645,340 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             // Execute a query with native LZ4 compression
             List<GenericRecord> records = client.queryAll("SELECT number, toString(number) FROM numbers(50)");
             Assert.assertEquals(records.size(), 50);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    // ========== Async Insert Tests ==========
+
+    /**
+     * Test basic async insert with InputStream.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertBasic() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String tableName = "async_insert_test_" + System.currentTimeMillis();
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            // Create test table
+            client.query("CREATE TABLE " + tableName + " (id UInt64, name String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            try {
+                // Insert data using InputStream
+                String csvData = "1,Alice\n2,Bob\n3,Charlie\n";
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+
+                InsertResponse insertResponse = client.insert(tableName, dataStream, ClickHouseFormat.CSV)
+                        .get(10, TimeUnit.SECONDS);
+
+                Assert.assertTrue(insertResponse.getWrittenRows() > 0 || insertResponse.getMetrics() != null);
+
+                // Verify data was inserted
+                List<GenericRecord> records = client.queryAll("SELECT * FROM " + tableName + " ORDER BY id");
+                Assert.assertEquals(records.size(), 3);
+                Assert.assertEquals(records.get(0).getString("name"), "Alice");
+                Assert.assertEquals(records.get(1).getString("name"), "Bob");
+                Assert.assertEquals(records.get(2).getString("name"), "Charlie");
+
+            } finally {
+                // Cleanup
+                client.query("DROP TABLE IF EXISTS " + tableName).get(10, TimeUnit.SECONDS).close();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test async insert with larger data set to verify streaming works.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertLargeData() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String tableName = "async_insert_large_test_" + System.currentTimeMillis();
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            // Create test table
+            client.query("CREATE TABLE " + tableName + " (id UInt64, data String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            try {
+                // Generate ~1MB of CSV data (10000 rows * ~100 bytes)
+                StringBuilder csvBuilder = new StringBuilder();
+                for (int i = 0; i < 10000; i++) {
+                    csvBuilder.append(i).append(",").append("data_row_" + i + "_padding_to_make_it_longer_").append("\n");
+                }
+                String csvData = csvBuilder.toString();
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+
+                InsertResponse insertResponse = client.insert(tableName, dataStream, ClickHouseFormat.CSV)
+                        .get(60, TimeUnit.SECONDS);
+
+                // Verify data was inserted
+                List<GenericRecord> records = client.queryAll("SELECT count() FROM " + tableName);
+                Assert.assertEquals(records.get(0).getLong(1), 10000L);
+
+            } finally {
+                // Cleanup
+                client.query("DROP TABLE IF EXISTS " + tableName).get(10, TimeUnit.SECONDS).close();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test async insert with compression enabled.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertWithCompression() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String tableName = "async_insert_compress_test_" + System.currentTimeMillis();
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .compressClientRequest(true)
+                .useHttpCompression(true)
+                .build()) {
+
+            // Create test table
+            client.query("CREATE TABLE " + tableName + " (id UInt64, value String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            try {
+                // Insert data with compression enabled
+                StringBuilder csvBuilder = new StringBuilder();
+                for (int i = 0; i < 1000; i++) {
+                    csvBuilder.append(i).append(",value_").append(i).append("\n");
+                }
+                String csvData = csvBuilder.toString();
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+
+                InsertResponse insertResponse = client.insert(tableName, dataStream, ClickHouseFormat.CSV)
+                        .get(30, TimeUnit.SECONDS);
+
+                // Verify data was inserted
+                List<GenericRecord> records = client.queryAll("SELECT count() FROM " + tableName);
+                Assert.assertEquals(records.get(0).getLong(1), 1000L);
+
+            } finally {
+                // Cleanup
+                client.query("DROP TABLE IF EXISTS " + tableName).get(10, TimeUnit.SECONDS).close();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test async insert with ClickHouse native LZ4 compression.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertWithNativeLZ4Compression() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String tableName = "async_insert_lz4_test_" + System.currentTimeMillis();
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .compressClientRequest(true)
+                .useHttpCompression(false)  // Use native ClickHouse LZ4
+                .build()) {
+
+            // Create test table
+            client.query("CREATE TABLE " + tableName + " (id UInt64, value String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            try {
+                // Insert data with native LZ4 compression
+                StringBuilder csvBuilder = new StringBuilder();
+                for (int i = 0; i < 500; i++) {
+                    csvBuilder.append(i).append(",native_lz4_value_").append(i).append("\n");
+                }
+                String csvData = csvBuilder.toString();
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+
+                InsertResponse insertResponse = client.insert(tableName, dataStream, ClickHouseFormat.CSV)
+                        .get(30, TimeUnit.SECONDS);
+
+                // Verify data was inserted
+                List<GenericRecord> records = client.queryAll("SELECT count() FROM " + tableName);
+                Assert.assertEquals(records.get(0).getLong(1), 500L);
+
+            } finally {
+                // Cleanup
+                client.query("DROP TABLE IF EXISTS " + tableName).get(10, TimeUnit.SECONDS).close();
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test that async and sync inserts produce the same results.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertResultsMatchSync() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String asyncTable = "async_insert_compare_async_" + System.currentTimeMillis();
+        String syncTable = "async_insert_compare_sync_" + System.currentTimeMillis();
+
+        String csvData = "1,test1\n2,test2\n3,test3\n4,test4\n5,test5\n";
+
+        // Insert using async client
+        try (Client asyncClient = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            asyncClient.query("CREATE TABLE " + asyncTable + " (id UInt64, value String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+            asyncClient.insert(asyncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail("Async insert failed: " + e.getMessage());
+        }
+
+        // Insert using sync client
+        try (Client syncClient = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(false)
+                .build()) {
+
+            syncClient.query("CREATE TABLE " + syncTable + " (id UInt64, value String) ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+            syncClient.insert(syncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail("Sync insert failed: " + e.getMessage());
+        }
+
+        // Compare results
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .build()) {
+
+            List<GenericRecord> asyncRecords = client.queryAll("SELECT * FROM " + asyncTable + " ORDER BY id");
+            List<GenericRecord> syncRecords = client.queryAll("SELECT * FROM " + syncTable + " ORDER BY id");
+
+            Assert.assertEquals(asyncRecords.size(), syncRecords.size());
+            for (int i = 0; i < asyncRecords.size(); i++) {
+                Assert.assertEquals(asyncRecords.get(i).getLong("id"), syncRecords.get(i).getLong("id"));
+                Assert.assertEquals(asyncRecords.get(i).getString("value"), syncRecords.get(i).getString("value"));
+            }
+
+            // Cleanup
+            client.query("DROP TABLE IF EXISTS " + asyncTable).get(10, TimeUnit.SECONDS).close();
+            client.query("DROP TABLE IF EXISTS " + syncTable).get(10, TimeUnit.SECONDS).close();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail("Comparison failed: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Test async insert with column names specified.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncInsertWithColumnNames() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+        String tableName = "async_insert_columns_test_" + System.currentTimeMillis();
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            // Create test table with default value
+            client.query("CREATE TABLE " + tableName + " (id UInt64, name String, status String DEFAULT 'active') ENGINE = Memory")
+                    .get(10, TimeUnit.SECONDS).close();
+
+            try {
+                // Insert only id and name columns (status should get default)
+                String csvData = "1,Alice\n2,Bob\n";
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+
+                client.insert(tableName, Arrays.asList("id", "name"), dataStream, ClickHouseFormat.CSV)
+                        .get(10, TimeUnit.SECONDS);
+
+                // Verify data was inserted with default status
+                List<GenericRecord> records = client.queryAll("SELECT * FROM " + tableName + " ORDER BY id");
+                Assert.assertEquals(records.size(), 2);
+                Assert.assertEquals(records.get(0).getString("status"), "active");
+                Assert.assertEquals(records.get(1).getString("status"), "active");
+
+            } finally {
+                // Cleanup
+                client.query("DROP TABLE IF EXISTS " + tableName).get(10, TimeUnit.SECONDS).close();
+            }
 
         } catch (Exception e) {
             e.printStackTrace();

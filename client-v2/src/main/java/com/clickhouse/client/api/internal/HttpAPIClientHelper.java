@@ -773,6 +773,91 @@ public class HttpAPIClientHelper {
         }
     }
 
+    /**
+     * Executes an async insert request with streaming body and optional compression.
+     * Data is streamed from the InputStream with on-the-fly compression, avoiding
+     * buffering the entire payload in memory.
+     *
+     * @param server target endpoint
+     * @param requestConfig request configuration
+     * @param dataStream input stream containing data to insert
+     * @return future that completes when headers are received (streaming continues in background)
+     */
+    public CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> executeInsertAsyncStreaming(
+            Endpoint server,
+            Map<String, Object> requestConfig,
+            InputStream dataStream) {
+        if (httpAsyncClient == null) {
+            throw new ClientException("Async HTTP client is not enabled. Set USE_ASYNC_HTTP to true.");
+        }
+
+        final URI uri = createRequestURI(server, requestConfig, true);
+
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+        int compressionBufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+
+        boolean shouldCompress = clientCompression && !appCompressedData;
+
+        BasicHttpRequest request = new BasicHttpRequest("POST", uri);
+        addHeadersToRequest(request, requestConfig);
+
+        StreamingAsyncEntityProducer entityProducer = new StreamingAsyncEntityProducer(
+                dataStream, CONTENT_TYPE,
+                shouldCompress, useHttpCompression,
+                compressionBufferSize, lz4Factory);
+
+        AsyncRequestProducer requestProducer = new BasicRequestProducer(request, entityProducer);
+        StreamingAsyncResponseConsumer responseConsumer = new StreamingAsyncResponseConsumer();
+
+        CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> future = new CompletableFuture<>();
+
+        responseConsumer.getHeadersFuture().whenComplete((response, headerEx) -> {
+            if (headerEx != null) {
+                future.completeExceptionally(headerEx);
+                return;
+            }
+
+            try {
+                if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                    future.completeExceptionally(new ClientMisconfigurationException(
+                            "Proxy authentication required. Please check your proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                    future.completeExceptionally(new ClientException(
+                            "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
+                           response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                    future.completeExceptionally(readErrorFromStreamingResponse(response));
+                } else {
+                    future.complete(response);
+                }
+            } catch (Exception e) {
+                future.completeExceptionally(e);
+            }
+        });
+
+        httpAsyncClient.execute(requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
+            @Override
+            public void completed(StreamingAsyncResponseConsumer.StreamingResponse response) {
+                LOG.debug("Async insert request completed for '{}'", uri);
+            }
+
+            @Override
+            public void failed(Exception ex) {
+                LOG.debug("Async insert request failed to '{}': {}", uri, ex.getMessage(), ex);
+                future.completeExceptionally(ex);
+            }
+
+            @Override
+            public void cancelled() {
+                future.cancel(true);
+            }
+        });
+
+        return future;
+    }
+
     private SimpleHttpRequest createSimpleHttpRequest(URI uri, Map<String, Object> requestConfig, String body) {
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
 

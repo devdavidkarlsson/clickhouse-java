@@ -842,7 +842,6 @@ public class Client implements AutoCloseable {
          *
          * <p><b>Current Limitations:</b></p>
          * <ul>
-         *   <li><b>INSERTS:</b> Insert operations use sync fallback path.</li>
          *   <li><b>MULTIPART:</b> Multipart requests use sync fallback path.</li>
          * </ul>
          *
@@ -1454,6 +1453,11 @@ public class Client implements AutoCloseable {
             throw new IllegalArgumentException("Buffer size must be greater than 0");
         }
 
+        // Use async path for InputStream-based inserts when async is enabled
+        if (httpClientHelper.isAsyncEnabled()) {
+            return executeInsertAsync(tableName, columnNames, data, format, settings);
+        }
+
         return insert(tableName, columnNames, new DataStreamWriter() {
                     @Override
                     public void onOutput(OutputStream out) throws IOException {
@@ -1471,6 +1475,62 @@ public class Client implements AutoCloseable {
                     }
                 },
                 format, settings);
+    }
+
+    private CompletableFuture<InsertResponse> executeInsertAsync(String tableName,
+                                                                  List<String> columnNames,
+                                                                  InputStream data,
+                                                                  ClickHouseFormat format,
+                                                                  InsertSettings settings) {
+        final InsertSettings requestSettings = new InsertSettings(buildRequestSettings(settings.getAllSettings()));
+        requestSettings.setOption(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey(), format);
+
+        String operationId = requestSettings.getOperationId();
+        ClientStatisticsHolder clientStats = operationId != null ? globalClientStats.remove(operationId) : null;
+        if (clientStats == null) {
+            clientStats = new ClientStatisticsHolder();
+        }
+        clientStats.start(ClientMetrics.OP_DURATION);
+        final ClientStatisticsHolder finalClientStats = clientStats;
+
+        // Build INSERT statement
+        StringBuilder sqlStmt = new StringBuilder("INSERT INTO ").append(tableName);
+        if (columnNames != null && !columnNames.isEmpty()) {
+            sqlStmt.append(" (");
+            for (String columnName : columnNames) {
+                sqlStmt.append(columnName).append(", ");
+            }
+            sqlStmt.deleteCharAt(sqlStmt.length() - 2);
+            sqlStmt.append(")");
+        }
+        sqlStmt.append(" FORMAT ").append(format.name());
+        requestSettings.serverSetting(ClickHouseHttpProto.QPARAM_QUERY_STMT, sqlStmt.toString());
+
+        if (requestSettings.getQueryId() == null && queryIdGenerator != null) {
+            requestSettings.setQueryId(queryIdGenerator.get());
+        }
+
+        final Endpoint selectedEndpoint = getNextAliveNode();
+
+        return httpClientHelper.executeInsertAsyncStreaming(selectedEndpoint, requestSettings.getAllSettings(), data)
+                .thenApply(response -> {
+                    OperationMetrics metrics = new OperationMetrics(finalClientStats);
+                    String summary = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_SRV_SUMMARY), "{}");
+                    ProcessParser.parseSummary(summary, metrics);
+                    String queryId = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID), requestSettings.getQueryId());
+                    metrics.setQueryId(queryId);
+                    metrics.operationComplete();
+
+                    try {
+                        response.close();
+                    } catch (IOException e) {
+                        LOG.debug("Error closing insert response", e);
+                    }
+
+                    return new InsertResponse(metrics);
+                });
     }
 
     /**
