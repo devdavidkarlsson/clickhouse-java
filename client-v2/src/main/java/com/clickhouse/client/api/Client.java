@@ -18,6 +18,7 @@ import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.internal.ClientStatisticsHolder;
 import com.clickhouse.client.api.internal.HttpAPIClientHelper;
 import com.clickhouse.client.api.internal.MapUtils;
+import com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer;
 import com.clickhouse.client.api.internal.TableSchemaParser;
 import com.clickhouse.client.api.internal.ValidationUtils;
 import com.clickhouse.client.api.metadata.ColumnToMethodMatchingStrategy;
@@ -832,18 +833,16 @@ public class Client implements AutoCloseable {
          * blocking thread-per-request model. This provides better scalability
          * under high concurrency without requiring thread pools.
          *
-         * <p><b>WARNING - Phase 1 Limitations:</b></p>
+         * <p>Response bodies are streamed through a pipe, avoiding memory buffering.
+         * This makes async suitable for large result sets.</p>
+         *
+         * <p><b>Current Limitations:</b></p>
          * <ul>
-         *   <li><b>MEMORY:</b> Response bodies are fully buffered in memory. Use only for
-         *       queries returning less than ~10MB. For large result sets, use sync client.</li>
          *   <li><b>COMPRESSION:</b> Client request compression ({@code compressClientRequest})
          *       is NOT supported - requests are sent uncompressed regardless of settings.</li>
          *   <li><b>INSERTS:</b> Insert operations use sync fallback path.</li>
          *   <li><b>MULTIPART:</b> Multipart requests use sync fallback path.</li>
          * </ul>
-         *
-         * <p><b>Best suited for:</b> High-concurrency, read-only workloads with small result sets
-         * (e.g., aggregations, counts, single-row lookups).</p>
          *
          * @param useAsyncHttp - true to enable async HTTP transport
          * @return this builder
@@ -1748,7 +1747,7 @@ public class Client implements AutoCloseable {
         final long startTime = System.nanoTime();
         final Endpoint selectedEndpoint = getNextAliveNode();
 
-        return httpClientHelper.executeRequestAsync(selectedEndpoint, requestSettings.getAllSettings(), sqlQuery)
+        return httpClientHelper.executeRequestAsyncStreaming(selectedEndpoint, requestSettings.getAllSettings(), sqlQuery)
                 .handle((response, ex) -> {
                     if (ex != null) {
                         Throwable cause = ex instanceof java.util.concurrent.CompletionException ? ex.getCause() : ex;

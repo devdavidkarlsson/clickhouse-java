@@ -451,4 +451,137 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             Assert.fail(e.getMessage());
         }
     }
+
+    /**
+     * Test async streaming with larger result set to verify streaming works.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncStreamingLargeResult() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            // Query that returns ~1MB of data (100K rows * ~10 bytes each)
+            try (QueryResponse response = client.query("SELECT number, toString(number) FROM numbers(100000)")
+                    .get(60, TimeUnit.SECONDS)) {
+
+                Assert.assertTrue(response.getReadRows() > 0, "Expected read_rows > 0");
+
+                // Read and count lines from the streaming response
+                java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(response.getInputStream()));
+                long lineCount = 0;
+                while (reader.readLine() != null) {
+                    lineCount++;
+                }
+
+                Assert.assertEquals(lineCount, 100000, "Expected 100000 rows");
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test async streaming response can be read incrementally.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncStreamingIncrementalRead() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            try (QueryResponse response = client.query("SELECT number FROM numbers(1000)")
+                    .get(30, TimeUnit.SECONDS)) {
+
+                java.io.InputStream is = response.getInputStream();
+                byte[] buffer = new byte[100];
+                int totalBytesRead = 0;
+                int bytesRead;
+
+                // Read incrementally
+                while ((bytesRead = is.read(buffer)) != -1) {
+                    totalBytesRead += bytesRead;
+                }
+
+                Assert.assertTrue(totalBytesRead > 0, "Expected to read data from stream");
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test that streaming async does NOT deadlock when reading is delayed.
+     * This tests the fix for the critical deadlock issue where:
+     * - NIO thread blocks on pipe write (buffer full)
+     * - User thread waits on future.get() (waiting for stream end)
+     * - Neither can proceed = deadlock
+     *
+     * The fix: future completes when headers arrive, not when stream ends.
+     */
+    @Test(groups = {"integration"}, timeOut = 30000) // 30 second timeout catches deadlock
+    public void testAsyncStreamingNoDeadlockOnDelayedRead() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .build()) {
+
+            // Query that returns data larger than pipe buffer (512KB)
+            // This would deadlock with the old implementation if user delays reading
+            CompletableFuture<QueryResponse> future = client.query(
+                    "SELECT number, repeat('x', 100) FROM numbers(10000)"); // ~1MB response
+
+            // Simulate delayed reading - OLD code would deadlock here
+            Thread.sleep(500);
+
+            // Get response - should complete immediately since headers arrived
+            QueryResponse response = future.get(5, TimeUnit.SECONDS);
+
+            // Now read the stream - NIO thread continues writing while we read
+            java.io.BufferedReader reader = new java.io.BufferedReader(
+                    new java.io.InputStreamReader(response.getInputStream()));
+            long lineCount = 0;
+            while (reader.readLine() != null) {
+                lineCount++;
+            }
+
+            Assert.assertEquals(lineCount, 10000, "Expected 10000 rows");
+            response.close();
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
 }

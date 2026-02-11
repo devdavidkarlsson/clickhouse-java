@@ -3,6 +3,7 @@ package com.clickhouse.client.api.query;
 import com.clickhouse.client.api.ClientConfigProperties;
 import com.clickhouse.client.api.ClientException;
 import com.clickhouse.client.api.http.ClickHouseHttpProto;
+import com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer;
 import com.clickhouse.client.api.metrics.OperationMetrics;
 import com.clickhouse.client.api.metrics.ServerMetrics;
 import com.clickhouse.data.ClickHouseFormat;
@@ -11,6 +12,7 @@ import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.Header;
 
 import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.TimeZone;
 
@@ -39,6 +41,8 @@ public class QueryResponse implements AutoCloseable {
 
     private byte[] bufferedResponseBody;
 
+    private InputStream streamingInputStream;
+
     public QueryResponse(ClassicHttpResponse response, ClickHouseFormat format, QuerySettings settings,
                          OperationMetrics operationMetrics) {
         this.httpResponse = response;
@@ -52,12 +56,29 @@ public class QueryResponse implements AutoCloseable {
 
     /**
      * Constructor for async responses. Buffers entire response body in memory.
-     * For large result sets, use the streaming sync API instead.
+     * For large result sets, use the streaming async API or sync API instead.
      */
     public QueryResponse(SimpleHttpResponse response, ClickHouseFormat format, QuerySettings settings,
                          OperationMetrics operationMetrics) {
         this.httpResponse = null;
         this.bufferedResponseBody = response.getBodyBytes();
+        this.streamingInputStream = null;
+        this.format = format;
+        this.operationMetrics = operationMetrics;
+        this.settings = settings;
+
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    /**
+     * Constructor for streaming async responses. Response body is streamed through a pipe,
+     * avoiding memory buffering. Suitable for large result sets.
+     */
+    public QueryResponse(StreamingAsyncResponseConsumer.StreamingResponse response, ClickHouseFormat format,
+                         QuerySettings settings, OperationMetrics operationMetrics) {
+        this.httpResponse = null;
+        this.bufferedResponseBody = null;
+        this.streamingInputStream = response.getInputStream();
         this.format = format;
         this.operationMetrics = operationMetrics;
         this.settings = settings;
@@ -78,6 +99,9 @@ public class QueryResponse implements AutoCloseable {
 
     public InputStream getInputStream() {
         try {
+            if (streamingInputStream != null) {
+                return streamingInputStream;
+            }
             if (bufferedResponseBody != null) {
                 return new ByteArrayInputStream(bufferedResponseBody);
             }
@@ -89,6 +113,13 @@ public class QueryResponse implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
+        if (streamingInputStream != null) {
+            try {
+                streamingInputStream.close();
+            } catch (IOException e) {
+                throw new ClientException("Failed to close streaming response", e);
+            }
+        }
         if (httpResponse != null) {
             try {
                 httpResponse.close();
