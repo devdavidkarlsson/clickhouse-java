@@ -484,14 +484,15 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
                 Assert.assertTrue(response.getReadRows() > 0, "Expected read_rows > 0");
 
                 // Read and count lines from the streaming response
-                java.io.BufferedReader reader = new java.io.BufferedReader(
-                        new java.io.InputStreamReader(response.getInputStream()));
-                long lineCount = 0;
-                while (reader.readLine() != null) {
-                    lineCount++;
-                }
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(response.getInputStream()))) {
+                    long lineCount = 0;
+                    while (reader.readLine() != null) {
+                        lineCount++;
+                    }
 
-                Assert.assertEquals(lineCount, 100000, "Expected 100000 rows");
+                    Assert.assertEquals(lineCount, 100000, "Expected 100000 rows");
+                }
             }
 
         } catch (Exception e) {
