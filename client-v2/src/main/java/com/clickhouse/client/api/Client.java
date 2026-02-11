@@ -41,6 +41,7 @@ import com.clickhouse.data.ClickHouseDataType;
 import com.clickhouse.data.ClickHouseFormat;
 import com.google.common.collect.ImmutableList;
 import net.jpountz.lz4.LZ4Factory;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.core5.concurrent.DefaultThreadFactory;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.Header;
@@ -77,6 +78,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
+import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -821,6 +823,33 @@ public class Client implements AutoCloseable {
          */
         public Builder useAsyncRequests(boolean async) {
             this.configuration.put(ClientConfigProperties.ASYNC_OPERATIONS.getKey(), String.valueOf(async));
+            return this;
+        }
+
+        /**
+         * Enables true async HTTP transport using Apache HttpClient 5 async API.
+         * When enabled, HTTP requests use NIO-based non-blocking I/O instead of
+         * blocking thread-per-request model. This provides better scalability
+         * under high concurrency without requiring thread pools.
+         *
+         * <p><b>WARNING - Phase 1 Limitations:</b></p>
+         * <ul>
+         *   <li><b>MEMORY:</b> Response bodies are fully buffered in memory. Use only for
+         *       queries returning less than ~10MB. For large result sets, use sync client.</li>
+         *   <li><b>COMPRESSION:</b> Client request compression ({@code compressClientRequest})
+         *       is NOT supported - requests are sent uncompressed regardless of settings.</li>
+         *   <li><b>INSERTS:</b> Insert operations use sync fallback path.</li>
+         *   <li><b>MULTIPART:</b> Multipart requests use sync fallback path.</li>
+         * </ul>
+         *
+         * <p><b>Best suited for:</b> High-concurrency, read-only workloads with small result sets
+         * (e.g., aggregations, counts, single-row lookups).</p>
+         *
+         * @param useAsyncHttp - true to enable async HTTP transport
+         * @return this builder
+         */
+        public Builder useAsyncHttp(boolean useAsyncHttp) {
+            this.configuration.put(ClientConfigProperties.USE_ASYNC_HTTP.getKey(), String.valueOf(useAsyncHttp));
             return this;
         }
 
@@ -1645,6 +1674,13 @@ public class Client implements AutoCloseable {
             requestSettings.setQueryId(queryIdGenerator.get());
         }
 
+        boolean useAsyncHttp = httpClientHelper.isAsyncEnabled();
+        boolean useMultipart = ClientConfigProperties.HTTP_SEND_PARAMS_IN_BODY.getOrDefault(requestSettings.getAllSettings());
+
+        if (useAsyncHttp && !(queryParams != null && useMultipart)) { // multipart not yet supported in async
+            return executeQueryAsync(sqlQuery, requestSettings, clientStats, 0);
+        }
+
         Supplier<QueryResponse> responseSupplier = () -> {
                 long startTime = System.nanoTime();
                 // Selecting some node
@@ -1653,7 +1689,6 @@ public class Client implements AutoCloseable {
                 for (int i = 0; i <= retries; i++) {
                     ClassicHttpResponse httpResponse = null;
                     try {
-                        boolean  useMultipart = ClientConfigProperties.HTTP_SEND_PARAMS_IN_BODY.getOrDefault(requestSettings.getAllSettings());
                         if (queryParams != null && useMultipart) {
                             httpResponse = httpClientHelper.executeMultiPartRequest(selectedEndpoint,
                                     requestSettings.getAllSettings(), sqlQuery);
@@ -1704,6 +1739,66 @@ public class Client implements AutoCloseable {
             };
 
         return runAsyncOperation(responseSupplier, requestSettings.getAllSettings());
+    }
+
+    private CompletableFuture<QueryResponse> executeQueryAsync(String sqlQuery,
+                                                               QuerySettings requestSettings,
+                                                               ClientStatisticsHolder clientStats,
+                                                               int attempt) {
+        final long startTime = System.nanoTime();
+        final Endpoint selectedEndpoint = getNextAliveNode();
+
+        return httpClientHelper.executeRequestAsync(selectedEndpoint, requestSettings.getAllSettings(), sqlQuery)
+                .handle((response, ex) -> {
+                    if (ex != null) {
+                        Throwable cause = ex instanceof java.util.concurrent.CompletionException ? ex.getCause() : ex;
+                        String msg = requestExMsg("Query", (attempt + 1), durationSince(startTime).toMillis(), requestSettings.getQueryId());
+                        RuntimeException wrappedException = httpClientHelper.wrapException(msg, (Exception) cause, requestSettings.getQueryId());
+
+                        if (httpClientHelper.shouldRetry((Exception) cause, requestSettings.getAllSettings()) && attempt < retries) {
+                            LOG.warn("Async query failed, retrying (attempt {}): {}", attempt + 1, cause.getMessage());
+                            return new AsyncRetryMarker(attempt + 1);
+                        }
+                        throw new java.util.concurrent.CompletionException(wrappedException);
+                    }
+
+                    if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE && attempt < retries) {
+                        LOG.warn("Failed to get response. Server returned {}. Retrying. (Duration: {})",
+                                response.getCode(), durationSince(startTime));
+                        return new AsyncRetryMarker(attempt + 1);
+                    }
+
+                    OperationMetrics metrics = new OperationMetrics(clientStats);
+                    String summary = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_SRV_SUMMARY), "{}");
+                    ProcessParser.parseSummary(summary, metrics);
+                    String queryId = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID), requestSettings.getQueryId());
+                    metrics.setQueryId(queryId);
+                    metrics.operationComplete();
+
+                    Header formatHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_FORMAT);
+                    ClickHouseFormat responseFormat = requestSettings.getFormat();
+                    if (formatHeader != null) {
+                        responseFormat = ClickHouseFormat.valueOf(formatHeader.getValue());
+                    }
+
+                    return new QueryResponse(response, responseFormat, requestSettings, metrics);
+                })
+                .thenCompose(result -> {
+                    if (result instanceof AsyncRetryMarker) {
+                        return executeQueryAsync(sqlQuery, requestSettings, clientStats, ((AsyncRetryMarker) result).nextAttempt);
+                    }
+                    return CompletableFuture.completedFuture((QueryResponse) result);
+                });
+    }
+
+    /** Marker to signal async retry without blocking .join() calls */
+    private static class AsyncRetryMarker {
+        final int nextAttempt;
+        AsyncRetryMarker(int nextAttempt) {
+            this.nextAttempt = nextAttempt;
+        }
     }
     public CompletableFuture<QueryResponse> query(String sqlQuery, Map<String, Object> queryParams) {
         return query(sqlQuery, queryParams, null);

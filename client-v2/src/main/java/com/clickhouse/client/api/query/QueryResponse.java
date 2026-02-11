@@ -6,9 +6,11 @@ import com.clickhouse.client.api.http.ClickHouseHttpProto;
 import com.clickhouse.client.api.metrics.OperationMetrics;
 import com.clickhouse.client.api.metrics.ServerMetrics;
 import com.clickhouse.data.ClickHouseFormat;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.Header;
 
+import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.util.TimeZone;
 
@@ -35,14 +37,35 @@ public class QueryResponse implements AutoCloseable {
 
     private ClassicHttpResponse httpResponse;
 
+    private byte[] bufferedResponseBody;
+
     public QueryResponse(ClassicHttpResponse response, ClickHouseFormat format, QuerySettings settings,
                          OperationMetrics operationMetrics) {
         this.httpResponse = response;
+        this.bufferedResponseBody = null;
         this.format = format;
         this.operationMetrics = operationMetrics;
         this.settings = settings;
 
-        Header tzHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE);
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    /**
+     * Constructor for async responses. Buffers entire response body in memory.
+     * For large result sets, use the streaming sync API instead.
+     */
+    public QueryResponse(SimpleHttpResponse response, ClickHouseFormat format, QuerySettings settings,
+                         OperationMetrics operationMetrics) {
+        this.httpResponse = null;
+        this.bufferedResponseBody = response.getBodyBytes();
+        this.format = format;
+        this.operationMetrics = operationMetrics;
+        this.settings = settings;
+
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    private void parseServerTimezone(Header tzHeader) {
         if (tzHeader != null) {
             try {
                 this.settings.setOption(ClientConfigProperties.SERVER_TIMEZONE.getKey(),
@@ -55,6 +78,9 @@ public class QueryResponse implements AutoCloseable {
 
     public InputStream getInputStream() {
         try {
+            if (bufferedResponseBody != null) {
+                return new ByteArrayInputStream(bufferedResponseBody);
+            }
             return httpResponse.getEntity().getContent();
         } catch (Exception e) {
             throw new ClientException("Failed to construct input stream", e);
@@ -63,7 +89,7 @@ public class QueryResponse implements AutoCloseable {
 
     @Override
     public void close() throws Exception {
-        if (httpResponse != null ) {
+        if (httpResponse != null) {
             try {
                 httpResponse.close();
             } catch (Exception e) {
