@@ -932,7 +932,16 @@ public class HttpAPIClientHelper {
         Header qIdHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID);
         final String queryId = qIdHeader == null ? "" : qIdHeader.getValue();
         Header codeHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE);
-        int serverCode = codeHeader == null ? 0 : Integer.parseInt(codeHeader.getValue());
+        int serverCode = 0;
+        if (codeHeader != null) {
+            try {
+                serverCode = Integer.parseInt(codeHeader.getValue());
+            } catch (NumberFormatException nfe) {
+                LOG.warn("Failed to parse exception code header value '{}' as integer; using 0 instead",
+                        codeHeader.getValue());
+                serverCode = 0;
+            }
+        }
 
         String msg;
         try {
