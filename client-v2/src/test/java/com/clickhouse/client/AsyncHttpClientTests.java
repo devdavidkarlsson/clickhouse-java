@@ -584,4 +584,64 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             Assert.fail(e.getMessage());
         }
     }
+
+    /**
+     * Test async query with LZ4 compression enabled.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncQueryWithCompression() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .compressClientRequest(true)
+                .useHttpCompression(true)
+                .build()) {
+
+            // Execute a query with compression enabled
+            List<GenericRecord> records = client.queryAll("SELECT number FROM numbers(100)");
+            Assert.assertEquals(records.size(), 100);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
+
+    /**
+     * Test async query with ClickHouse native LZ4 compression.
+     */
+    @Test(groups = {"integration"})
+    public void testAsyncQueryWithNativeLZ4Compression() {
+        if (isCloud()) {
+            return;
+        }
+
+        ClickHouseNode server = getServer(ClickHouseProtocol.HTTP);
+
+        try (Client client = new Client.Builder()
+                .addEndpoint(server.getBaseUri())
+                .setUsername("default")
+                .setPassword(getPassword())
+                .useAsyncHttp(true)
+                .compressClientRequest(true)
+                .useHttpCompression(false)  // Use native ClickHouse LZ4
+                .build()) {
+
+            // Execute a query with native LZ4 compression
+            List<GenericRecord> records = client.queryAll("SELECT number, toString(number) FROM numbers(50)");
+            Assert.assertEquals(records.size(), 50);
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            Assert.fail(e.getMessage());
+        }
+    }
 }

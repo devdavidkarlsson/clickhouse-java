@@ -833,13 +833,15 @@ public class Client implements AutoCloseable {
          * blocking thread-per-request model. This provides better scalability
          * under high concurrency without requiring thread pools.
          *
-         * <p>Response bodies are streamed through a pipe, avoiding memory buffering.
-         * This makes async suitable for large result sets.</p>
+         * <p>Features:</p>
+         * <ul>
+         *   <li>Response bodies are streamed through a pipe, avoiding memory buffering</li>
+         *   <li>LZ4 request compression is supported ({@code compressClientRequest})</li>
+         *   <li>Suitable for large result sets and high-concurrency workloads</li>
+         * </ul>
          *
          * <p><b>Current Limitations:</b></p>
          * <ul>
-         *   <li><b>COMPRESSION:</b> Client request compression ({@code compressClientRequest})
-         *       is NOT supported - requests are sent uncompressed regardless of settings.</li>
          *   <li><b>INSERTS:</b> Insert operations use sync fallback path.</li>
          *   <li><b>MULTIPART:</b> Multipart requests use sync fallback path.</li>
          * </ul>

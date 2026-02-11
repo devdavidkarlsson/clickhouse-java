@@ -181,12 +181,6 @@ public class HttpAPIClientHelper {
             this.httpAsyncClient = createHttpAsyncClient(initSslContext, configuration);
             this.httpAsyncClient.start();
             LOG.info("Async HTTP client initialized and started");
-
-            boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(configuration);
-            if (clientCompression) {
-                LOG.warn("Async HTTP is enabled with compressClientRequest=true, but client-side compression " +
-                        "is NOT supported in async mode. Requests will be sent UNCOMPRESSED.");
-            }
         } else {
             this.httpAsyncClient = null;
         }
@@ -661,6 +655,17 @@ public class HttpAPIClientHelper {
         final URI uri = createRequestURI(server, requestConfig, true);
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
 
+        // Apply compression if configured (acceptable for queries which are small payloads)
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
+        if (clientCompression && !appCompressedData) {
+            int bufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+            bodyBytes = compressLZ4(bodyBytes, useHttpCompression, bufferSize);
+            LOG.debug("Async request compressed: {} -> {} bytes", body.length(), bodyBytes.length);
+        }
+
         BasicHttpRequest request = new BasicHttpRequest("POST", uri);
         addHeadersToRequest(request, requestConfig);
 
@@ -736,17 +741,40 @@ public class HttpAPIClientHelper {
         }
     }
 
+    /**
+     * Compresses data using LZ4 compression.
+     *
+     * @param data the uncompressed data
+     * @param useHttpCompression if true, uses framed LZ4 (HTTP Content-Encoding compatible);
+     *                           if false, uses ClickHouse native LZ4 format
+     * @param bufferSize buffer size for compression
+     * @return compressed data
+     */
+    private byte[] compressLZ4(byte[] data, boolean useHttpCompression, int bufferSize) {
+        try {
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            OutputStream compressingStream;
+
+            if (useHttpCompression) {
+                compressingStream = new org.apache.commons.compress.compressors.lz4.FramedLZ4CompressorOutputStream(baos);
+            } else {
+                compressingStream = new ClickHouseLZ4OutputStream(baos, lz4Factory.fastCompressor(), bufferSize);
+            }
+
+            try {
+                compressingStream.write(data);
+            } finally {
+                compressingStream.close();
+            }
+
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new ClientException("Failed to compress request data", e);
+        }
+    }
+
     private SimpleHttpRequest createSimpleHttpRequest(URI uri, Map<String, Object> requestConfig, String body) {
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
-
-        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
-        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
-        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
-
-        if (clientCompression && !useHttpCompression && !appCompressedData) {
-            LOG.warn("Client-side LZ4 compression (compressClientRequest=true) is not supported for async HTTP. " +
-                    "Request will be sent UNCOMPRESSED. For compressed requests, use sync client or disable async.");
-        }
 
         SimpleRequestBuilder builder = SimpleRequestBuilder.post(uri)
                 .setBody(bodyBytes, CONTENT_TYPE);
@@ -1055,10 +1083,16 @@ public class HttpAPIClientHelper {
             req.addHeader(HttpHeaders.PROXY_AUTHORIZATION, proxyAuthHeaderValue);
         }
 
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
         boolean serverCompression = ClientConfigProperties.COMPRESS_SERVER_RESPONSE.getOrDefault(requestConfig);
         boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
         if (useHttpCompression && serverCompression) {
             setHeader(req, HttpHeaders.ACCEPT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+        }
+        if (useHttpCompression && clientCompression && !appCompressedData) {
+            setHeader(req, HttpHeaders.CONTENT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
         }
 
         for (String key : requestConfig.keySet()) {
