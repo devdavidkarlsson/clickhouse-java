@@ -41,6 +41,9 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
     private volatile Exception streamError;
     private volatile long totalBytesWritten = 0;
 
+    // Reusable buffer to avoid GC pressure from per-chunk allocations
+    private final byte[] reusableBuffer = new byte[CAPACITY_INCREMENT];
+
     public StreamingAsyncResponseConsumer() {
         this(DEFAULT_PIPE_SIZE);
     }
@@ -91,14 +94,17 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
         }
 
         try {
-            if (src.hasRemaining()) {
-                int chunkSize = src.remaining();
-                byte[] bytes = new byte[chunkSize];
-                src.get(bytes);
-                pipedOutputStream.write(bytes);
+            long bytesWrittenThisCall = 0;
+            while (src.hasRemaining()) {
+                int bytesToRead = Math.min(src.remaining(), reusableBuffer.length);
+                src.get(reusableBuffer, 0, bytesToRead);
+                pipedOutputStream.write(reusableBuffer, 0, bytesToRead);
+                bytesWrittenThisCall += bytesToRead;
+            }
+            if (bytesWrittenThisCall > 0) {
+                totalBytesWritten += bytesWrittenThisCall;
                 pipedOutputStream.flush(); // Ensure data is immediately available to reader
-                totalBytesWritten += chunkSize;
-                LOG.debug("data() wrote {} bytes (total: {}), endOfStream={}", chunkSize, totalBytesWritten, endOfStream);
+                LOG.debug("data() wrote {} bytes (total: {}), endOfStream={}", bytesWrittenThisCall, totalBytesWritten, endOfStream);
             }
 
             if (endOfStream) {
