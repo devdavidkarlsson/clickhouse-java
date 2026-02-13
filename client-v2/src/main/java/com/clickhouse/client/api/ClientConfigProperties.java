@@ -57,6 +57,14 @@ public enum ClientConfigProperties {
 
     ASYNC_OPERATIONS("async", Boolean.class, "false"),
 
+    /**
+     * Enables true async HTTP transport using Apache HttpClient 5 async API.
+     * When enabled, HTTP requests use NIO-based non-blocking I/O instead of
+     * blocking thread-per-request model. This provides better scalability
+     * under high concurrency.
+     */
+    USE_ASYNC_HTTP("use_async_http", Boolean.class, "false"),
+
     CONNECTION_TTL("connection_ttl", Long.class, "-1"),
 
     CONNECTION_TIMEOUT("connection_timeout", Long.class),

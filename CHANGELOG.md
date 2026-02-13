@@ -1,3 +1,19 @@
+## [Unreleased]
+
+### New Features
+- [client-v2] Async HTTP support using Apache HttpClient 5 NIO API (https://github.com/ClickHouse/clickhouse-java/issues/1831)
+  - True non-blocking I/O for queries and inserts
+  - Streaming responses with constant memory usage (~512KB regardless of result size)
+  - Streaming request compression (HTTP framed LZ4 and ClickHouse native LZ4)
+  - 96-99% thread reduction under high concurrency (1000 concurrent requests use 2-4 threads instead of 1000)
+  - Opt-in via `useAsyncHttp(true)` builder option
+  - Full backward compatibility (async disabled by default)
+  - Comprehensive test coverage (19 integration tests)
+
+### Known Limitations
+- [client-v2] Async HTTP: SOCKS proxy not supported (Apache HttpClient async limitation)
+- [client-v2] Async HTTP: Multipart requests use sync fallback
+
 ## 0.9.6
 Release is aimed to address potential security risk in one of the dependencies (see below). We strongly recommend to upgrade. 
 
