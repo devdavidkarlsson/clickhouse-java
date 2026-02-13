@@ -10,6 +10,7 @@ import com.clickhouse.client.api.insert.InsertResponse;
 import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.query.GenericRecord;
 import com.clickhouse.client.api.query.QueryResponse;
+import com.clickhouse.client.api.query.QuerySettings;
 import com.clickhouse.data.ClickHouseFormat;
 import com.github.tomakehurst.wiremock.WireMockServer;
 import com.github.tomakehurst.wiremock.client.WireMock;
@@ -130,8 +131,8 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             CompletableFuture<Long> resultFuture = client.query("SELECT count() FROM numbers(1000)")
                     .thenApply(response -> {
                         try {
-                            // Read the count from response
-                            return response.getReadRows();
+                            // Read the result row count from response
+                            return response.getResultRows();
                         } finally {
                             try {
                                 response.close();
@@ -142,7 +143,7 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
                     });
 
             Long count = resultFuture.get(30, TimeUnit.SECONDS);
-            Assert.assertEquals(count.longValue(), 1L); // Query reads 1000 rows but returns 1 row (count)
+            Assert.assertEquals(count.longValue(), 1L); // Query returns 1 row (count result)
 
         } catch (Exception e) {
             e.printStackTrace();
@@ -194,12 +195,13 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             return;
         }
 
-        int serverPort = new Random().nextInt(1000) + 10000;
         WireMockServer mockServer = new WireMockServer(WireMockConfiguration
-                .options().port(serverPort).notifier(new ConsoleNotifier(false)));
+                .options().dynamicPort().notifier(new ConsoleNotifier(false)));
         mockServer.start();
 
         try {
+            int serverPort = mockServer.port();
+
             // First request returns 503 (Service Unavailable)
             mockServer.addStubMapping(WireMock.post(WireMock.anyUrl())
                     .inScenario("Retry503")
@@ -355,12 +357,13 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
             return;
         }
 
-        int serverPort = new Random().nextInt(1000) + 10000;
         WireMockServer mockServer = new WireMockServer(WireMockConfiguration
-                .options().port(serverPort).notifier(new ConsoleNotifier(false)));
+                .options().dynamicPort().notifier(new ConsoleNotifier(false)));
         mockServer.start();
 
         try {
+            int serverPort = mockServer.port();
+
             // Setup a delayed response
             mockServer.addStubMapping(WireMock.post(WireMock.anyUrl())
                     .willReturn(WireMock.aResponse()
@@ -478,7 +481,9 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
                 .build()) {
 
             // Query that returns ~1MB of data (100K rows * ~10 bytes each)
-            try (QueryResponse response = client.query("SELECT number, toString(number) FROM numbers(100000)")
+            // Use TabSeparated format so we can count lines with BufferedReader
+            QuerySettings settings = new QuerySettings().setFormat(ClickHouseFormat.TabSeparated);
+            try (QueryResponse response = client.query("SELECT number, toString(number) FROM numbers(100000)", settings)
                     .get(60, TimeUnit.SECONDS)) {
 
                 Assert.assertTrue(response.getReadRows() > 0, "Expected read_rows > 0");
@@ -519,7 +524,9 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
                 .useAsyncHttp(true)
                 .build()) {
 
-            try (QueryResponse response = client.query("SELECT number FROM numbers(1000)")
+            // Use TabSeparated format for text-based streaming
+            QuerySettings settings = new QuerySettings().setFormat(ClickHouseFormat.TabSeparated);
+            try (QueryResponse response = client.query("SELECT number FROM numbers(1000)", settings)
                     .get(30, TimeUnit.SECONDS)) {
 
                 java.io.InputStream is = response.getInputStream();
@@ -567,26 +574,27 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
 
             // Query that returns data larger than pipe buffer (512KB)
             // This would deadlock with the old implementation if user delays reading
+            // Use TabSeparated format so we can count lines with BufferedReader
+            QuerySettings settings = new QuerySettings().setFormat(ClickHouseFormat.TabSeparated);
             CompletableFuture<QueryResponse> future = client.query(
-                    "SELECT number, repeat('x', 100) FROM numbers(10000)"); // ~1MB response
+                    "SELECT number, repeat('x', 100) FROM numbers(10000)", settings); // ~1MB response
 
             // Simulate delayed reading - OLD code would deadlock here
             Thread.sleep(500);
 
             // Get response - should complete immediately since headers arrived
-            QueryResponse response = future.get(5, TimeUnit.SECONDS);
+            try (QueryResponse response = future.get(5, TimeUnit.SECONDS)) {
+                // Now read the stream - NIO thread continues writing while we read
+                try (java.io.BufferedReader reader = new java.io.BufferedReader(
+                        new java.io.InputStreamReader(response.getInputStream()))) {
+                    long lineCount = 0;
+                    while (reader.readLine() != null) {
+                        lineCount++;
+                    }
 
-            // Now read the stream - NIO thread continues writing while we read
-            try (java.io.BufferedReader reader = new java.io.BufferedReader(
-                    new java.io.InputStreamReader(response.getInputStream()))) {
-                long lineCount = 0;
-                while (reader.readLine() != null) {
-                    lineCount++;
+                    Assert.assertEquals(lineCount, 10000, "Expected 10000 rows");
                 }
-
-                Assert.assertEquals(lineCount, 10000, "Expected 10000 rows");
             }
-            response.close();
 
         } catch (Exception e) {
             e.printStackTrace();

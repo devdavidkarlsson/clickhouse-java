@@ -1477,6 +1477,19 @@ public class Client implements AutoCloseable {
                 format, settings);
     }
 
+    /**
+     * Executes an async insert operation using the async HTTP client.
+     *
+     * <p><b>IMPORTANT:</b> Unlike the synchronous insert path, this async implementation
+     * does NOT support automatic retry on 503 Service Unavailable responses. The synchronous
+     * path retries on 503 and retryable failures (invoking onRetry()/data.reset()), but
+     * async inserts with InputStreams cannot reliably support retry because streams are
+     * not always resettable.</p>
+     *
+     * <p>If you require retry semantics for insert operations, use the synchronous client
+     * (set useAsyncHttp(false)) or implement retry logic in your application code with
+     * a resettable data source.</p>
+     */
     private CompletableFuture<InsertResponse> executeInsertAsync(String tableName,
                                                                   List<String> columnNames,
                                                                   InputStream data,

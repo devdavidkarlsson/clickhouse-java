@@ -39,6 +39,7 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
     private HttpResponse response;
     private ContentType contentType;
     private volatile Exception streamError;
+    private volatile long totalBytesWritten = 0;
 
     public StreamingAsyncResponseConsumer() {
         this(DEFAULT_PIPE_SIZE);
@@ -85,20 +86,27 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
     @Override
     protected void data(ByteBuffer src, boolean endOfStream) throws IOException {
         if (streamError != null) {
+            LOG.debug("data() called but streamError already set: {}", streamError.getMessage());
             return;
         }
 
         try {
             if (src.hasRemaining()) {
-                byte[] bytes = new byte[src.remaining()];
+                int chunkSize = src.remaining();
+                byte[] bytes = new byte[chunkSize];
                 src.get(bytes);
                 pipedOutputStream.write(bytes);
+                pipedOutputStream.flush(); // Ensure data is immediately available to reader
+                totalBytesWritten += chunkSize;
+                LOG.debug("data() wrote {} bytes (total: {}), endOfStream={}", chunkSize, totalBytesWritten, endOfStream);
             }
 
             if (endOfStream) {
+                LOG.debug("data() endOfStream=true, closing output. Total bytes: {}", totalBytesWritten);
                 closeOutputStream();
             }
         } catch (IOException e) {
+            LOG.debug("data() IOException: {} (total bytes written: {})", e.getMessage(), totalBytesWritten);
             streamError = e;
             closeOutputStream();
             throw e;
@@ -129,12 +137,16 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
 
     private void closeOutputStream() {
         if (outputClosed.compareAndSet(false, true)) {
+            LOG.debug("closeOutputStream() called, total bytes written: {}", totalBytesWritten);
             try {
                 pipedOutputStream.close();
                 streamCompleteFuture.complete(null);
+                LOG.debug("closeOutputStream() completed successfully");
             } catch (IOException e) {
-                LOG.debug("Error closing piped output stream", e);
+                LOG.debug("Error closing piped output stream: {}", e.getMessage());
             }
+        } else {
+            LOG.debug("closeOutputStream() already closed, skipping");
         }
     }
 

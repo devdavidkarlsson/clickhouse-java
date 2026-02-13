@@ -609,6 +609,10 @@ public class HttpAPIClientHelper {
                         future.completeExceptionally(new ClientException(
                                 "Server returned '502 Bad gateway'. Check network and proxy settings."));
                         return;
+                    } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                        // Return 503 normally - let caller handle retry logic
+                        future.complete(response);
+                        return;
                     } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
                                response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
                         future.completeExceptionally(readErrorFromAsyncResponse(response));
@@ -691,6 +695,9 @@ public class HttpAPIClientHelper {
                 } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
                     future.completeExceptionally(new ClientException(
                             "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                    // Return 503 normally - let caller handle retry logic
+                    future.complete(response);
                 } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
                            response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
                     future.completeExceptionally(readErrorFromStreamingResponse(response));
@@ -826,6 +833,9 @@ public class HttpAPIClientHelper {
                 } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
                     future.completeExceptionally(new ClientException(
                             "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                    // Return 503 normally - let caller handle retry logic
+                    future.complete(response);
                 } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
                            response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
                     future.completeExceptionally(readErrorFromStreamingResponse(response));
@@ -861,6 +871,17 @@ public class HttpAPIClientHelper {
     private SimpleHttpRequest createSimpleHttpRequest(URI uri, Map<String, Object> requestConfig, String body) {
         byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
 
+        // Apply compression if configured
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
+        if (clientCompression && !appCompressedData) {
+            int bufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+            bodyBytes = compressLZ4(bodyBytes, useHttpCompression, bufferSize);
+            LOG.debug("Async simple request compressed: {} -> {} bytes", body.length(), bodyBytes.length);
+        }
+
         SimpleRequestBuilder builder = SimpleRequestBuilder.post(uri)
                 .setBody(bodyBytes, CONTENT_TYPE);
         addHeadersToSimpleRequest(builder, requestConfig);
@@ -881,9 +902,16 @@ public class HttpAPIClientHelper {
         builder.setHeader(ClickHouseHttpProto.HEADER_DATABASE,
                 ClientConfigProperties.DATABASE.getOrDefault(requestConfig));
 
+        // Check if custom Authorization header is set
+        String customAuthHeaderKey = ClientConfigProperties.HTTP_HEADER_PREFIX + HttpHeaders.AUTHORIZATION;
+        boolean hasCustomAuth = requestConfig.containsKey(customAuthHeaderKey) &&
+                                requestConfig.get(customAuthHeaderKey) != null;
+
         if (ClientConfigProperties.SSL_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
-            builder.setHeader(ClickHouseHttpProto.HEADER_DB_USER,
-                    ClientConfigProperties.USER.getOrDefault(requestConfig));
+            if (!hasCustomAuth) {
+                builder.setHeader(ClickHouseHttpProto.HEADER_DB_USER,
+                        ClientConfigProperties.USER.getOrDefault(requestConfig));
+            }
             builder.setHeader(ClickHouseHttpProto.HEADER_SSL_CERT_AUTH, "on");
         } else if (ClientConfigProperties.HTTP_USE_BASIC_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
             String user = ClientConfigProperties.USER.getOrDefault(requestConfig);
@@ -891,7 +919,8 @@ public class HttpAPIClientHelper {
             builder.addHeader(HttpHeaders.AUTHORIZATION,
                     "Basic " + Base64.getEncoder().encodeToString(
                             (user + ":" + password).getBytes(StandardCharsets.UTF_8)));
-        } else {
+        } else if (!hasCustomAuth) {
+            // Only set CH auth headers if no custom Authorization header is provided
             builder.setHeader(ClickHouseHttpProto.HEADER_DB_USER,
                     ClientConfigProperties.USER.getOrDefault(requestConfig));
             String password = ClientConfigProperties.PASSWORD.getOrDefault(requestConfig);
@@ -1198,6 +1227,16 @@ public class HttpAPIClientHelper {
             }
         }
 
+        // Special cases - match sync addHeaders behavior
+        if (req.containsHeader(HttpHeaders.AUTHORIZATION)
+            && (req.containsHeader(ClickHouseHttpProto.HEADER_DB_USER) ||
+                req.containsHeader(ClickHouseHttpProto.HEADER_DB_PASSWORD)))
+        {
+            // user has set auth header for purpose, lets remove ours
+            req.removeHeaders(ClickHouseHttpProto.HEADER_DB_USER);
+            req.removeHeaders(ClickHouseHttpProto.HEADER_DB_PASSWORD);
+        }
+
         correctUserAgentHeader(req, requestConfig);
     }
 
@@ -1301,7 +1340,12 @@ public class HttpAPIClientHelper {
             return defaultValue;
         }
 
-        return converter.apply(header.getValue());
+        try {
+            return converter.apply(header.getValue());
+        } catch (RuntimeException e) {
+            LOG.debug("Failed to parse header value '{}': {}", header.getValue(), e.getMessage());
+            return defaultValue;
+        }
     }
 
     public boolean shouldRetry(Throwable ex, Map<String, Object> requestSettings) {
