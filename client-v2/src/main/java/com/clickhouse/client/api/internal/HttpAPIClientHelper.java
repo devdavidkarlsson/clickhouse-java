@@ -115,6 +115,7 @@ import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
@@ -594,7 +595,7 @@ public class HttpAPIClientHelper {
 
         CompletableFuture<SimpleHttpResponse> future = new CompletableFuture<>();
 
-        httpAsyncClient.execute(request, new FutureCallback<SimpleHttpResponse>() {
+        Future<SimpleHttpResponse> httpFuture = httpAsyncClient.execute(request, new FutureCallback<SimpleHttpResponse>() {
             @Override
             public void completed(SimpleHttpResponse response) {
                 try {
@@ -630,6 +631,13 @@ public class HttpAPIClientHelper {
             @Override
             public void cancelled() {
                 future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
             }
         });
 
@@ -710,7 +718,8 @@ public class HttpAPIClientHelper {
             }
         });
 
-        httpAsyncClient.execute(requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
+        Future<StreamingAsyncResponseConsumer.StreamingResponse> httpFuture = httpAsyncClient.execute(
+                requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
             @Override
             public void completed(StreamingAsyncResponseConsumer.StreamingResponse response) {
                 // Stream has ended. Future should already be completed via headersFuture.
@@ -727,6 +736,13 @@ public class HttpAPIClientHelper {
             @Override
             public void cancelled() {
                 future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
             }
         });
 
@@ -866,7 +882,8 @@ public class HttpAPIClientHelper {
             }
         });
 
-        httpAsyncClient.execute(requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
+        Future<StreamingAsyncResponseConsumer.StreamingResponse> httpFuture = httpAsyncClient.execute(
+                requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
             @Override
             public void completed(StreamingAsyncResponseConsumer.StreamingResponse response) {
                 LOG.debug("Async insert request completed for '{}'", uri);
@@ -881,6 +898,13 @@ public class HttpAPIClientHelper {
             @Override
             public void cancelled() {
                 future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
             }
         });
 
