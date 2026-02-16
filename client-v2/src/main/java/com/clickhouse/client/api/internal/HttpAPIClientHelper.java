@@ -176,9 +176,19 @@ public class HttpAPIClientHelper {
         // Initialize async client
         boolean useAsyncHttp = ClientConfigProperties.USE_ASYNC_HTTP.getOrDefault(configuration);
         if (useAsyncHttp) {
-            this.httpAsyncClient = createHttpAsyncClient(initSslContext, configuration);
-            this.httpAsyncClient.start();
-            LOG.info("Async HTTP client initialized and started");
+            try {
+                CloseableHttpAsyncClient asyncClient = createHttpAsyncClient(initSslContext, configuration);
+                asyncClient.start();
+                this.httpAsyncClient = asyncClient;
+                LOG.info("Async HTTP client initialized and started");
+            } catch (RuntimeException | Error e) {
+                try {
+                    this.httpClient.close();
+                } catch (IOException closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+                throw e;
+            }
         } else {
             this.httpAsyncClient = null;
         }
