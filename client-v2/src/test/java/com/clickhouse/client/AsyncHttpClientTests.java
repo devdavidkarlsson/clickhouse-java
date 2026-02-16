@@ -878,67 +878,68 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
 
         String csvData = "1,test1\n2,test2\n3,test3\n4,test4\n5,test5\n";
 
-        // Insert using async client
-        try (Client asyncClient = new Client.Builder()
-                .addEndpoint(server.getBaseUri())
-                .setUsername("default")
-                .setPassword(getPassword())
-                .useAsyncHttp(true)
-                .build()) {
+        try {
+            // Insert using async client
+            try (Client asyncClient = new Client.Builder()
+                    .addEndpoint(server.getBaseUri())
+                    .setUsername("default")
+                    .setPassword(getPassword())
+                    .useAsyncHttp(true)
+                    .build()) {
 
-            asyncClient.query("CREATE TABLE " + asyncTable + " (id UInt64, value String) ENGINE = Memory")
-                    .get(10, TimeUnit.SECONDS).close();
+                asyncClient.query("CREATE TABLE " + asyncTable + " (id UInt64, value String) ENGINE = Memory")
+                        .get(10, TimeUnit.SECONDS).close();
 
-            ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
-            asyncClient.insert(asyncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            Assert.fail("Async insert failed: " + e.getMessage());
-        }
-
-        // Insert using sync client
-        try (Client syncClient = new Client.Builder()
-                .addEndpoint(server.getBaseUri())
-                .setUsername("default")
-                .setPassword(getPassword())
-                .useAsyncHttp(false)
-                .build()) {
-
-            syncClient.query("CREATE TABLE " + syncTable + " (id UInt64, value String) ENGINE = Memory")
-                    .get(10, TimeUnit.SECONDS).close();
-
-            ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
-            syncClient.insert(syncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
-
-        } catch (Exception e) {
-            e.printStackTrace();
-            Assert.fail("Sync insert failed: " + e.getMessage());
-        }
-
-        // Compare results
-        try (Client client = new Client.Builder()
-                .addEndpoint(server.getBaseUri())
-                .setUsername("default")
-                .setPassword(getPassword())
-                .build()) {
-
-            List<GenericRecord> asyncRecords = client.queryAll("SELECT * FROM " + asyncTable + " ORDER BY id");
-            List<GenericRecord> syncRecords = client.queryAll("SELECT * FROM " + syncTable + " ORDER BY id");
-
-            Assert.assertEquals(asyncRecords.size(), syncRecords.size());
-            for (int i = 0; i < asyncRecords.size(); i++) {
-                Assert.assertEquals(asyncRecords.get(i).getLong("id"), syncRecords.get(i).getLong("id"));
-                Assert.assertEquals(asyncRecords.get(i).getString("value"), syncRecords.get(i).getString("value"));
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+                asyncClient.insert(asyncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
             }
 
-            // Cleanup
-            client.query("DROP TABLE IF EXISTS " + asyncTable).get(10, TimeUnit.SECONDS).close();
-            client.query("DROP TABLE IF EXISTS " + syncTable).get(10, TimeUnit.SECONDS).close();
+            // Insert using sync client
+            try (Client syncClient = new Client.Builder()
+                    .addEndpoint(server.getBaseUri())
+                    .setUsername("default")
+                    .setPassword(getPassword())
+                    .useAsyncHttp(false)
+                    .build()) {
 
+                syncClient.query("CREATE TABLE " + syncTable + " (id UInt64, value String) ENGINE = Memory")
+                        .get(10, TimeUnit.SECONDS).close();
+
+                ByteArrayInputStream dataStream = new ByteArrayInputStream(csvData.getBytes(StandardCharsets.UTF_8));
+                syncClient.insert(syncTable, dataStream, ClickHouseFormat.CSV).get(10, TimeUnit.SECONDS);
+            }
+
+            // Compare results
+            try (Client client = new Client.Builder()
+                    .addEndpoint(server.getBaseUri())
+                    .setUsername("default")
+                    .setPassword(getPassword())
+                    .build()) {
+
+                List<GenericRecord> asyncRecords = client.queryAll("SELECT * FROM " + asyncTable + " ORDER BY id");
+                List<GenericRecord> syncRecords = client.queryAll("SELECT * FROM " + syncTable + " ORDER BY id");
+
+                Assert.assertEquals(asyncRecords.size(), syncRecords.size());
+                for (int i = 0; i < asyncRecords.size(); i++) {
+                    Assert.assertEquals(asyncRecords.get(i).getLong("id"), syncRecords.get(i).getLong("id"));
+                    Assert.assertEquals(asyncRecords.get(i).getString("value"), syncRecords.get(i).getString("value"));
+                }
+            }
         } catch (Exception e) {
             e.printStackTrace();
-            Assert.fail("Comparison failed: " + e.getMessage());
+            Assert.fail(e.getMessage());
+        } finally {
+            // Cleanup tables regardless of test outcome
+            try (Client cleanupClient = new Client.Builder()
+                    .addEndpoint(server.getBaseUri())
+                    .setUsername("default")
+                    .setPassword(getPassword())
+                    .build()) {
+                cleanupClient.query("DROP TABLE IF EXISTS " + asyncTable).get(10, TimeUnit.SECONDS).close();
+                cleanupClient.query("DROP TABLE IF EXISTS " + syncTable).get(10, TimeUnit.SECONDS).close();
+            } catch (Exception ignored) {
+                // Cleanup errors shouldn't fail the test
+            }
         }
     }
 

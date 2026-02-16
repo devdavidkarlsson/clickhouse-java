@@ -113,21 +113,17 @@ public class QueryResponse implements AutoCloseable {
         }
     }
 
+    /**
+     * Closes this response and releases associated resources.
+     * IOExceptions are propagated as-is to maintain AutoCloseable contract consistency.
+     */
     @Override
     public void close() throws Exception {
         if (streamingInputStream != null) {
-            try {
-                streamingInputStream.close();
-            } catch (IOException e) {
-                throw new ClientException("Failed to close streaming response", e);
-            }
+            streamingInputStream.close();
         }
         if (httpResponse != null) {
-            try {
-                httpResponse.close();
-            } catch (Exception e) {
-                throw new ClientException("Failed to close response", e);
-            }
+            httpResponse.close();
         }
     }
 

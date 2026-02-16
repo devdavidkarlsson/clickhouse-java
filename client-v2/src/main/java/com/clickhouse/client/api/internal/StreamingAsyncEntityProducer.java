@@ -15,6 +15,7 @@ import java.io.PipedOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
 /**
@@ -28,6 +29,7 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     private static final Logger LOG = LoggerFactory.getLogger(StreamingAsyncEntityProducer.class);
     private static final int DEFAULT_BUFFER_SIZE = 8 * 1024; // 8KB read buffer
     private static final int PIPE_BUFFER_SIZE = 512 * 1024; // 512KB pipe buffer
+    private static final AtomicLong THREAD_COUNTER = new AtomicLong(0); // For unique thread names
 
     private final ContentType contentType;
     private final InputStream sourceStream;
@@ -104,7 +106,7 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
                     } catch (IOException ignored) {
                     }
                 }
-            }, "async-compression-thread");
+            }, "async-compression-thread-" + THREAD_COUNTER.incrementAndGet());
             compressionThread.setDaemon(true);
             compressionThread.start();
         } else {
