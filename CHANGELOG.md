@@ -5,7 +5,7 @@
   - True non-blocking I/O for queries and inserts
   - Streaming responses with constant memory usage (~512KB regardless of result size)
   - Streaming request compression (HTTP framed LZ4 and ClickHouse native LZ4)
-  - 96-99% thread reduction under high concurrency (1000 concurrent requests use 2-4 threads instead of 1000)
+  - Eliminates blocking threads waiting for I/O under high concurrency, significantly reducing thread usage compared to the synchronous client
   - Opt-in via `useAsyncHttp(true)` builder option
   - Full backward compatibility (async disabled by default)
   - Added test coverage (integration tests)
