@@ -97,7 +97,12 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
                     error.set(e);
                     try {
                         compressedOutputStream.close();
-                    } catch (IOException ignored) {}
+                    } catch (IOException ignored) {
+                    }
+                    try {
+                        sourceStream.close();
+                    } catch (IOException ignored) {
+                    }
                 }
             }, "async-compression-thread");
             compressionThread.setDaemon(true);
