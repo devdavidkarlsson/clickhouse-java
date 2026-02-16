@@ -61,7 +61,9 @@ public class QueryResponse implements AutoCloseable {
     public QueryResponse(SimpleHttpResponse response, ClickHouseFormat format, QuerySettings settings,
                          OperationMetrics operationMetrics) {
         this.httpResponse = null;
-        this.bufferedResponseBody = response.getBodyBytes();
+        // getBodyBytes() can return null for empty responses
+        byte[] bodyBytes = response.getBodyBytes();
+        this.bufferedResponseBody = bodyBytes != null ? bodyBytes : new byte[0];
         this.streamingInputStream = null;
         this.format = format;
         this.operationMetrics = operationMetrics;

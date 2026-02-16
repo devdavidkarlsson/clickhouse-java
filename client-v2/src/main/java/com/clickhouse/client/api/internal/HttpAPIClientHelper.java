@@ -976,10 +976,17 @@ public class HttpAPIClientHelper {
             builder.addHeader(HttpHeaders.PROXY_AUTHORIZATION, proxyAuthHeaderValue);
         }
 
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
         boolean serverCompression = ClientConfigProperties.COMPRESS_SERVER_RESPONSE.getOrDefault(requestConfig);
         boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
-        if (useHttpCompression && serverCompression) {
-            builder.setHeader(HttpHeaders.ACCEPT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+        if (useHttpCompression) {
+            if (serverCompression) {
+                builder.setHeader(HttpHeaders.ACCEPT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+            }
+            if (clientCompression && !appCompressedData) {
+                builder.setHeader(HttpHeaders.CONTENT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+            }
         }
 
         for (String key : requestConfig.keySet()) {
