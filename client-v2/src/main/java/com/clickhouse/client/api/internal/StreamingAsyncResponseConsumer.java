@@ -121,7 +121,8 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
 
     @Override
     protected StreamingResponse buildResult() {
-        // Return the same response that was provided via headersFuture
+        // Note: This creates a new instance each time, but all instances share the same
+        // underlying streams and futures. The headersFuture provides the primary response.
         return new StreamingResponse(response, contentType, pipedInputStream, streamCompleteFuture);
     }
 
@@ -146,8 +147,13 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
             LOG.debug("closeOutputStream() called, total bytes written: {}", totalBytesWritten);
             try {
                 pipedOutputStream.close();
-                streamCompleteFuture.complete(null);
-                LOG.debug("closeOutputStream() completed successfully");
+                if (streamError != null) {
+                    streamCompleteFuture.completeExceptionally(streamError);
+                    LOG.debug("closeOutputStream() completed with error");
+                } else {
+                    streamCompleteFuture.complete(null);
+                    LOG.debug("closeOutputStream() completed successfully");
+                }
             } catch (IOException e) {
                 LOG.debug("Error closing piped output stream: {}", e.getMessage());
             }

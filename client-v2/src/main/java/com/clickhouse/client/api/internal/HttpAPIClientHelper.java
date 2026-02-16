@@ -21,11 +21,9 @@ import org.apache.hc.client5.http.ConnectTimeoutException;
 import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
 import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.client5.http.async.methods.SimpleRequestBuilder;
-import org.apache.hc.client5.http.async.methods.SimpleResponseConsumer;
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
-import org.apache.hc.client5.http.config.TlsConfig;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.entity.mime.MultipartPartBuilder;
 import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
@@ -37,7 +35,6 @@ import org.apache.hc.client5.http.impl.io.BasicHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.ManagedHttpClientConnectionFactory;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
-import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.io.HttpClientConnectionManager;
 import org.apache.hc.client5.http.io.ManagedHttpClientConnection;
@@ -690,9 +687,11 @@ public class HttpAPIClientHelper {
 
             try {
                 if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                    closeStreamingResponse(response);
                     future.completeExceptionally(new ClientMisconfigurationException(
                             "Proxy authentication required. Please check your proxy settings."));
                 } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                    closeStreamingResponse(response);
                     future.completeExceptionally(new ClientException(
                             "Server returned '502 Bad gateway'. Check network and proxy settings."));
                 } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
@@ -700,11 +699,13 @@ public class HttpAPIClientHelper {
                     future.complete(response);
                 } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
                            response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                    // readErrorFromStreamingResponse closes the response
                     future.completeExceptionally(readErrorFromStreamingResponse(response));
                 } else {
                     future.complete(response);
                 }
             } catch (Exception e) {
+                closeStreamingResponse(response);
                 future.completeExceptionally(e);
             }
         });
@@ -751,6 +752,14 @@ public class HttpAPIClientHelper {
             } catch (IOException e) {
                 LOG.debug("Failed to close streaming response after reading error", e);
             }
+        }
+    }
+
+    private void closeStreamingResponse(StreamingAsyncResponseConsumer.StreamingResponse response) {
+        try {
+            response.close();
+        } catch (IOException e) {
+            LOG.debug("Failed to close streaming response", e);
         }
     }
 
@@ -834,9 +843,11 @@ public class HttpAPIClientHelper {
 
             try {
                 if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                    closeStreamingResponse(response);
                     future.completeExceptionally(new ClientMisconfigurationException(
                             "Proxy authentication required. Please check your proxy settings."));
                 } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                    closeStreamingResponse(response);
                     future.completeExceptionally(new ClientException(
                             "Server returned '502 Bad gateway'. Check network and proxy settings."));
                 } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
@@ -844,11 +855,13 @@ public class HttpAPIClientHelper {
                     future.complete(response);
                 } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
                            response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                    // readErrorFromStreamingResponse closes the response
                     future.completeExceptionally(readErrorFromStreamingResponse(response));
                 } else {
                     future.complete(response);
                 }
             } catch (Exception e) {
+                closeStreamingResponse(response);
                 future.completeExceptionally(e);
             }
         });

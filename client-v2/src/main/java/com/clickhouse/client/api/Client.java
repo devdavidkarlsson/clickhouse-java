@@ -18,7 +18,6 @@ import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.internal.ClientStatisticsHolder;
 import com.clickhouse.client.api.internal.HttpAPIClientHelper;
 import com.clickhouse.client.api.internal.MapUtils;
-import com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer;
 import com.clickhouse.client.api.internal.TableSchemaParser;
 import com.clickhouse.client.api.internal.ValidationUtils;
 import com.clickhouse.client.api.metadata.ColumnToMethodMatchingStrategy;
@@ -42,7 +41,6 @@ import com.clickhouse.data.ClickHouseDataType;
 import com.clickhouse.data.ClickHouseFormat;
 import com.google.common.collect.ImmutableList;
 import net.jpountz.lz4.LZ4Factory;
-import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.core5.concurrent.DefaultThreadFactory;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.Header;
@@ -79,7 +77,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.TimeoutException;
-import java.util.function.Function;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 
@@ -1513,7 +1510,7 @@ public class Client implements AutoCloseable {
             for (String columnName : columnNames) {
                 sqlStmt.append(columnName).append(", ");
             }
-            sqlStmt.deleteCharAt(sqlStmt.length() - 2);
+            sqlStmt.setLength(sqlStmt.length() - 2);
             sqlStmt.append(")");
         }
         sqlStmt.append(" FORMAT ").append(format.name());
@@ -1611,7 +1608,7 @@ public class Client implements AutoCloseable {
             for (String columnName : columnNames) {
                 sqlStmt.append(columnName).append(", ");
             }
-            sqlStmt.deleteCharAt(sqlStmt.length() - 2);
+            sqlStmt.setLength(sqlStmt.length() - 2);
             sqlStmt.append(")");
         }
         sqlStmt.append(" FORMAT ").append(format.name());
@@ -1827,9 +1824,11 @@ public class Client implements AutoCloseable {
                     if (ex != null) {
                         Throwable cause = ex instanceof java.util.concurrent.CompletionException ? ex.getCause() : ex;
                         String msg = requestExMsg("Query", (attempt + 1), durationSince(startTime).toMillis(), requestSettings.getQueryId());
-                        RuntimeException wrappedException = httpClientHelper.wrapException(msg, (Exception) cause, requestSettings.getQueryId());
+                        RuntimeException wrappedException = (cause instanceof Exception)
+                                ? httpClientHelper.wrapException(msg, (Exception) cause, requestSettings.getQueryId())
+                                : new RuntimeException(msg, cause);
 
-                        if (httpClientHelper.shouldRetry((Exception) cause, requestSettings.getAllSettings()) && attempt < retries) {
+                        if (httpClientHelper.shouldRetry(cause, requestSettings.getAllSettings()) && attempt < retries) {
                             LOG.warn("Async query failed, retrying (attempt {}): {}", attempt + 1, cause.getMessage());
                             return new AsyncRetryMarker(attempt + 1);
                         }
@@ -1839,6 +1838,12 @@ public class Client implements AutoCloseable {
                     if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE && attempt < retries) {
                         LOG.warn("Failed to get response. Server returned {}. Retrying. (Duration: {})",
                                 response.getCode(), durationSince(startTime));
+                        // Close the streaming response before retrying to avoid resource leaks
+                        try {
+                            response.close();
+                        } catch (Exception closeEx) {
+                            LOG.debug("Failed to close streaming response before retry", closeEx);
+                        }
                         return new AsyncRetryMarker(attempt + 1);
                     }
 

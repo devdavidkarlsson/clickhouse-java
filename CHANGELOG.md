@@ -8,7 +8,7 @@
   - 96-99% thread reduction under high concurrency (1000 concurrent requests use 2-4 threads instead of 1000)
   - Opt-in via `useAsyncHttp(true)` builder option
   - Full backward compatibility (async disabled by default)
-  - Comprehensive test coverage (19 integration tests)
+  - Added test coverage (integration tests)
 
 ### Known Limitations
 - [client-v2] Async HTTP: SOCKS proxy not supported (Apache HttpClient async limitation)
