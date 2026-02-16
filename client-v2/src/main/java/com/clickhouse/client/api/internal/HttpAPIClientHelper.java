@@ -739,12 +739,18 @@ public class HttpAPIClientHelper {
             int bytesRead = is.read(errorBytes, 0, ERROR_BODY_BUFFER_SIZE);
             String errorBody = bytesRead > 0 ? new String(errorBytes, 0, bytesRead, StandardCharsets.UTF_8) : "";
 
-            Header errorCodeHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE);
-            int errorCode = errorCodeHeader != null ? Integer.parseInt(errorCodeHeader.getValue()) : 0;
+            int errorCode = getHeaderVal(response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE),
+                    0, Integer::parseInt);
 
             return new ServerException(errorCode, errorBody, response.getCode(), null);
         } catch (Exception e) {
             return new ClientException("Failed to read error response", e);
+        } finally {
+            try {
+                response.close();
+            } catch (IOException e) {
+                LOG.debug("Failed to close streaming response after reading error", e);
+            }
         }
     }
 
