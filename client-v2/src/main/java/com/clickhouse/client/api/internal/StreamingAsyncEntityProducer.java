@@ -20,6 +20,7 @@ import java.util.concurrent.ThreadFactory;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
 
@@ -38,27 +39,81 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
 
     /**
      * Shared thread pool for compression tasks - bounded to prevent thread explosion under high concurrency.
-     * Uses daemon threads so it won't prevent JVM shutdown. This is intentionally static and shared
-     * across all StreamingAsyncEntityProducer instances to limit total thread count. The pool is not
-     * shut down explicitly - daemon threads will terminate when the JVM exits. This design provides
-     * efficient resource sharing while avoiding complex lifecycle management.
+     * Uses daemon threads so it won't prevent JVM shutdown if shutdown is not called.
+     *
+     * <p>Lifecycle management: Call {@link #acquireExecutor()} when creating an async client and
+     * {@link #releaseExecutor()} when closing it. The pool is lazily created on first acquire and
+     * shut down when the last client releases it.</p>
      */
     private static final int COMPRESSION_POOL_SIZE = Math.max(2, Runtime.getRuntime().availableProcessors());
-    private static final ExecutorService COMPRESSION_EXECUTOR = new ThreadPoolExecutor(
-            COMPRESSION_POOL_SIZE,
-            COMPRESSION_POOL_SIZE,
-            60L, TimeUnit.SECONDS,
-            new LinkedBlockingQueue<>(1000), // Bounded queue to provide backpressure
-            new ThreadFactory() {
-                @Override
-                public Thread newThread(Runnable r) {
-                    Thread t = new Thread(r, "async-compression-" + THREAD_COUNTER.incrementAndGet());
-                    t.setDaemon(true);
-                    return t;
+    private static final Object EXECUTOR_LOCK = new Object();
+    private static final AtomicInteger EXECUTOR_REF_COUNT = new AtomicInteger(0);
+    private static volatile ExecutorService compressionExecutor = null;
+
+    /**
+     * Acquires a reference to the shared compression executor.
+     * Call this when creating an async HTTP client that may use compression.
+     * Must be paired with a call to {@link #releaseExecutor()} when the client is closed.
+     */
+    public static void acquireExecutor() {
+        synchronized (EXECUTOR_LOCK) {
+            if (EXECUTOR_REF_COUNT.getAndIncrement() == 0) {
+                compressionExecutor = createCompressionExecutor();
+                LOG.debug("Created compression executor pool");
+            }
+        }
+    }
+
+    /**
+     * Releases a reference to the shared compression executor.
+     * When the last reference is released, the executor is gracefully shut down.
+     */
+    public static void releaseExecutor() {
+        synchronized (EXECUTOR_LOCK) {
+            if (EXECUTOR_REF_COUNT.decrementAndGet() == 0 && compressionExecutor != null) {
+                LOG.debug("Shutting down compression executor pool");
+                compressionExecutor.shutdown();
+                try {
+                    if (!compressionExecutor.awaitTermination(5, TimeUnit.SECONDS)) {
+                        compressionExecutor.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    compressionExecutor.shutdownNow();
+                    Thread.currentThread().interrupt();
                 }
-            },
-            new ThreadPoolExecutor.CallerRunsPolicy() // If queue full, run in caller thread (backpressure)
-    );
+                compressionExecutor = null;
+            }
+        }
+    }
+
+    private static ExecutorService createCompressionExecutor() {
+        return new ThreadPoolExecutor(
+                COMPRESSION_POOL_SIZE,
+                COMPRESSION_POOL_SIZE,
+                60L, TimeUnit.SECONDS,
+                new LinkedBlockingQueue<>(1000), // Bounded queue to provide backpressure
+                new ThreadFactory() {
+                    @Override
+                    public Thread newThread(Runnable r) {
+                        Thread t = new Thread(r, "ch-async-compress-" + THREAD_COUNTER.incrementAndGet());
+                        t.setDaemon(true);
+                        return t;
+                    }
+                },
+                new ThreadPoolExecutor.CallerRunsPolicy() // If queue full, run in caller thread (backpressure)
+        );
+    }
+
+    private static ExecutorService getExecutor() {
+        ExecutorService exec = compressionExecutor;
+        if (exec == null || exec.isShutdown()) {
+            // Fallback: if executor not acquired properly, create inline (caller's thread)
+            // This handles edge cases but logs a warning
+            LOG.warn("Compression executor not acquired - compression will run in caller thread");
+            return null;
+        }
+        return exec;
+    }
 
     private final ContentType contentType;
     private final InputStream sourceStream;
@@ -103,8 +158,9 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
             compressedInputStream = new PipedInputStream(compressedOutputStream, PIPE_BUFFER_SIZE);
             activeInputStream = compressedInputStream;
 
-            // Submit compression task to shared thread pool
-            COMPRESSION_EXECUTOR.submit(() -> {
+            // Submit compression task to shared thread pool (or run inline if not available)
+            ExecutorService executor = getExecutor();
+            Runnable compressionTask = () -> {
                 try {
                     OutputStream compressingStream;
                     if (useHttpCompression) {
@@ -134,7 +190,16 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
                     } catch (IOException ignored) {
                     }
                 }
-            });
+            };
+
+            if (executor != null) {
+                executor.submit(compressionTask);
+            } else {
+                // Fallback: run compression in a new thread (less efficient but functional)
+                Thread t = new Thread(compressionTask, "ch-compress-fallback-" + THREAD_COUNTER.incrementAndGet());
+                t.setDaemon(true);
+                t.start();
+            }
         } else {
             // No compression - read directly from source
             activeInputStream = sourceStream;

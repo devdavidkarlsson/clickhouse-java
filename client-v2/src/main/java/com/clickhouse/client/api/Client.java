@@ -18,6 +18,7 @@ import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.internal.ClientStatisticsHolder;
 import com.clickhouse.client.api.internal.HttpAPIClientHelper;
 import com.clickhouse.client.api.internal.MapUtils;
+import com.clickhouse.client.api.internal.StreamingAsyncEntityProducer;
 import com.clickhouse.client.api.internal.TableSchemaParser;
 import com.clickhouse.client.api.internal.ValidationUtils;
 import com.clickhouse.client.api.metadata.ColumnToMethodMatchingStrategy;
@@ -115,19 +116,51 @@ public class Client implements AutoCloseable {
 
     /**
      * Shared scheduler for async operation timeouts (Java 8 compatible alternative to orTimeout).
-     * Uses daemon threads so it won't prevent JVM shutdown. This is intentionally static and
-     * not shut down explicitly - the daemon threads will terminate when the JVM exits.
-     * This design avoids complex lifecycle management while ensuring resources are not leaked
-     * beyond JVM termination.
+     * Uses daemon threads as a fallback so it won't prevent JVM shutdown if not properly released.
+     *
+     * <p>Lifecycle management: The scheduler is lazily created when the first async client is created
+     * and shut down when the last async client is closed. This ensures graceful resource cleanup.</p>
      */
-    private static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHEDULER =
-            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
-                Thread t = new Thread(r, "clickhouse-async-timeout");
-                t.setDaemon(true);
-                return t;
-            });
+    private static final Object TIMEOUT_SCHEDULER_LOCK = new Object();
+    private static final java.util.concurrent.atomic.AtomicInteger TIMEOUT_SCHEDULER_REF_COUNT =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static volatile java.util.concurrent.ScheduledExecutorService timeoutScheduler = null;
+
+    private static void acquireTimeoutScheduler() {
+        synchronized (TIMEOUT_SCHEDULER_LOCK) {
+            if (TIMEOUT_SCHEDULER_REF_COUNT.getAndIncrement() == 0) {
+                timeoutScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ch-async-timeout");
+                    t.setDaemon(true);
+                    return t;
+                });
+                LOG.debug("Created async timeout scheduler");
+            }
+        }
+    }
+
+    private static void releaseTimeoutScheduler() {
+        synchronized (TIMEOUT_SCHEDULER_LOCK) {
+            if (TIMEOUT_SCHEDULER_REF_COUNT.decrementAndGet() == 0 && timeoutScheduler != null) {
+                LOG.debug("Shutting down async timeout scheduler");
+                timeoutScheduler.shutdown();
+                try {
+                    if (!timeoutScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                        timeoutScheduler.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    timeoutScheduler.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+                timeoutScheduler = null;
+            }
+        }
+    }
 
     private HttpAPIClientHelper httpClientHelper = null;
+
+    /** Tracks whether this client instance uses async HTTP (for proper executor cleanup) */
+    private final boolean usesAsyncHttp;
 
     private final List<Endpoint> endpoints;
     private final Map<String, Object> configuration;
@@ -209,6 +242,13 @@ public class Client implements AutoCloseable {
         this.serverVersion = configuration.getOrDefault(ClientConfigProperties.SERVER_VERSION.getKey(), "unknown");
         this.dbUser = configuration.getOrDefault(ClientConfigProperties.USER.getKey(), ClientConfigProperties.USER.getDefObjVal());
         this.typeHintMapping = (Map<ClickHouseDataType, Class<?>>) this.configuration.get(ClientConfigProperties.TYPE_HINT_MAPPING.getKey());
+
+        // Acquire shared async resources if async HTTP is enabled
+        this.usesAsyncHttp = httpClientHelper.isAsyncEnabled();
+        if (this.usesAsyncHttp) {
+            acquireTimeoutScheduler();
+            StreamingAsyncEntityProducer.acquireExecutor();
+        }
     }
 
     /**
@@ -246,6 +286,10 @@ public class Client implements AutoCloseable {
      * Frees the resources associated with the client.
      * <ul>
      *     <li>Shuts down the shared operation executor by calling {@code shutdownNow()}</li>
+     *     <li>Closes the HTTP client helper</li>
+     *     <li>Releases shared async resources (compression executor, timeout scheduler) if this
+     *         client was using async HTTP. When the last async client is closed, these shared
+     *         resources are gracefully shut down.</li>
      * </ul>
      */
     @Override
@@ -264,6 +308,12 @@ public class Client implements AutoCloseable {
 
         if (httpClientHelper != null) {
             httpClientHelper.close();
+        }
+
+        // Release shared async resources if this client was using them
+        if (usesAsyncHttp) {
+            StreamingAsyncEntityProducer.releaseExecutor();
+            releaseTimeoutScheduler();
         }
     }
 
@@ -1910,8 +1960,13 @@ public class Client implements AutoCloseable {
             return future;
         }
         // Java 8 compatible timeout implementation using shared scheduler
+        java.util.concurrent.ScheduledExecutorService scheduler = timeoutScheduler;
+        if (scheduler == null || scheduler.isShutdown()) {
+            LOG.warn("Timeout scheduler not available - timeout will not be applied");
+            return future;
+        }
         CompletableFuture<T> timeoutFuture = new CompletableFuture<>();
-        java.util.concurrent.ScheduledFuture<?> scheduled = TIMEOUT_SCHEDULER.schedule(() -> {
+        java.util.concurrent.ScheduledFuture<?> scheduled = scheduler.schedule(() -> {
             if (!future.isDone()) {
                 timeoutFuture.completeExceptionally(
                         new TimeoutException("Async operation timed out after " + timeoutMs + "ms"));
