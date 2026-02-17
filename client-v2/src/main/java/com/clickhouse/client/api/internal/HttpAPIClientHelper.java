@@ -35,6 +35,7 @@ import org.apache.hc.client5.http.impl.io.BasicHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.ManagedHttpClientConnectionFactory;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
 import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.io.HttpClientConnectionManager;
 import org.apache.hc.client5.http.io.ManagedHttpClientConnection;
@@ -429,7 +430,21 @@ public class HttpAPIClientHelper {
             connMgrBuilder.setTlsStrategy(tlsStrategy);
         }
 
-        asyncBuilder.setConnectionManager(connMgrBuilder.build());
+        PoolingAsyncClientConnectionManager asyncConnMgr = connMgrBuilder.build();
+        asyncBuilder.setConnectionManager(asyncConnMgr);
+
+        // Register metrics for async connection pool
+        if (metricsRegistry != null) {
+            try {
+                String mGroupName = ClientConfigProperties.METRICS_GROUP_NAME.getOrDefault(configuration);
+                Class<?> micrometerLoader = getClass().getClassLoader().loadClass("com.clickhouse.client.api.metrics.MicrometerLoader");
+                Method applyMethod = micrometerLoader.getDeclaredMethod("applyAsyncPoolingMetricsBinder",
+                        Object.class, String.class, PoolingAsyncClientConnectionManager.class);
+                applyMethod.invoke(micrometerLoader, metricsRegistry, mGroupName, asyncConnMgr);
+            } catch (Exception e) {
+                LOG.error("Failed to register async connection pool metrics", e);
+            }
+        }
 
         String proxyHost = (String) configuration.get(ClientConfigProperties.PROXY_HOST.getKey());
         Integer proxyPort = (Integer) configuration.get(ClientConfigProperties.PROXY_PORT.getKey());

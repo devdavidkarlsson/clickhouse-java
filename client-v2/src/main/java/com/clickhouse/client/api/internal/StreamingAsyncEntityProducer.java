@@ -14,6 +14,11 @@ import java.io.PipedInputStream;
 import java.io.PipedOutputStream;
 import java.nio.ByteBuffer;
 import java.util.Set;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
@@ -31,6 +36,24 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     private static final int PIPE_BUFFER_SIZE = 512 * 1024; // 512KB pipe buffer
     private static final AtomicLong THREAD_COUNTER = new AtomicLong(0); // For unique thread names
 
+    // Shared thread pool for compression tasks - bounded to prevent thread explosion under high concurrency
+    private static final int COMPRESSION_POOL_SIZE = Math.max(2, Runtime.getRuntime().availableProcessors());
+    private static final ExecutorService COMPRESSION_EXECUTOR = new ThreadPoolExecutor(
+            COMPRESSION_POOL_SIZE,
+            COMPRESSION_POOL_SIZE,
+            60L, TimeUnit.SECONDS,
+            new LinkedBlockingQueue<>(1000), // Bounded queue to provide backpressure
+            new ThreadFactory() {
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "async-compression-" + THREAD_COUNTER.incrementAndGet());
+                    t.setDaemon(true);
+                    return t;
+                }
+            },
+            new ThreadPoolExecutor.CallerRunsPolicy() // If queue full, run in caller thread (backpressure)
+    );
+
     private final ContentType contentType;
     private final InputStream sourceStream;
     private final boolean compressData;
@@ -42,9 +65,8 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     private final AtomicBoolean completed = new AtomicBoolean(false);
     private final AtomicReference<Exception> error = new AtomicReference<>();
 
-    // For compression: compress in background thread, read compressed data here
+    // For compression: compress in thread pool, read compressed data here
     private PipedInputStream compressedInputStream;
-    private Thread compressionThread;
     private InputStream activeInputStream;
 
     public StreamingAsyncEntityProducer(InputStream sourceStream, ContentType contentType) {
@@ -75,8 +97,8 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
             compressedInputStream = new PipedInputStream(compressedOutputStream, PIPE_BUFFER_SIZE);
             activeInputStream = compressedInputStream;
 
-            // Start compression in background thread
-            compressionThread = new Thread(() -> {
+            // Submit compression task to shared thread pool
+            COMPRESSION_EXECUTOR.submit(() -> {
                 try {
                     OutputStream compressingStream;
                     if (useHttpCompression) {
@@ -106,9 +128,7 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
                     } catch (IOException ignored) {
                     }
                 }
-            }, "async-compression-thread-" + THREAD_COUNTER.incrementAndGet());
-            compressionThread.setDaemon(true);
-            compressionThread.start();
+            });
         } else {
             // No compression - read directly from source
             activeInputStream = sourceStream;
@@ -201,6 +221,7 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     @Override
     public void releaseResources() {
         completed.set(true);
+        // Closing streams will cause any running compression task to fail and exit
         try {
             if (activeInputStream != null) {
                 activeInputStream.close();
@@ -210,15 +231,6 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
             }
         } catch (IOException e) {
             LOG.debug("Error closing streams", e);
-        }
-
-        if (compressionThread != null && compressionThread.isAlive()) {
-            compressionThread.interrupt();
-            try {
-                compressionThread.join(1000); // Wait up to 1 second for clean shutdown
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-            }
         }
     }
 }

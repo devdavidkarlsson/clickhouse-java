@@ -113,6 +113,14 @@ import java.util.stream.Collectors;
 public class Client implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(Client.class);
 
+    // Shared scheduler for async operation timeouts (Java 8 compatible alternative to orTimeout)
+    private static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHEDULER =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                Thread t = new Thread(r, "clickhouse-async-timeout");
+                t.setDaemon(true);
+                return t;
+            });
+
     private HttpAPIClientHelper httpClientHelper = null;
 
     private final List<Endpoint> endpoints;
@@ -1452,7 +1460,8 @@ public class Client implements AutoCloseable {
 
         // Use async path for InputStream-based inserts when async is enabled
         if (httpClientHelper.isAsyncEnabled()) {
-            return executeInsertAsync(tableName, columnNames, data, format, settings);
+            CompletableFuture<InsertResponse> future = executeInsertAsync(tableName, columnNames, data, format, settings);
+            return applyAsyncTimeout(future, settings.getNetworkTimeout());
         }
 
         return insert(tableName, columnNames, new DataStreamWriter() {
@@ -1749,7 +1758,8 @@ public class Client implements AutoCloseable {
         boolean useMultipart = ClientConfigProperties.HTTP_SEND_PARAMS_IN_BODY.getOrDefault(requestSettings.getAllSettings());
 
         if (useAsyncHttp && !(queryParams != null && useMultipart)) { // multipart not yet supported in async
-            return executeQueryAsync(sqlQuery, requestSettings, clientStats, 0);
+            CompletableFuture<QueryResponse> future = executeQueryAsync(sqlQuery, requestSettings, clientStats, 0);
+            return applyAsyncTimeout(future, requestSettings.getNetworkTimeout());
         }
 
         Supplier<QueryResponse> responseSupplier = () -> {
@@ -1879,6 +1889,41 @@ public class Client implements AutoCloseable {
             this.nextAttempt = nextAttempt;
         }
     }
+
+    /**
+     * Applies a timeout to an async operation if configured.
+     * If timeout is 0 or negative, returns the original future unchanged.
+     * Java 8 compatible implementation (orTimeout requires Java 9+).
+     *
+     * @param future the future to wrap with timeout
+     * @param timeoutMs timeout in milliseconds (0 or negative means no timeout)
+     * @return future with timeout applied, or original future if no timeout
+     */
+    private <T> CompletableFuture<T> applyAsyncTimeout(CompletableFuture<T> future, long timeoutMs) {
+        if (timeoutMs <= 0) {
+            return future;
+        }
+        // Java 8 compatible timeout implementation using shared scheduler
+        CompletableFuture<T> timeoutFuture = new CompletableFuture<>();
+        java.util.concurrent.ScheduledFuture<?> scheduled = TIMEOUT_SCHEDULER.schedule(() -> {
+            if (!future.isDone()) {
+                timeoutFuture.completeExceptionally(
+                        new TimeoutException("Async operation timed out after " + timeoutMs + "ms"));
+            }
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+
+        future.whenComplete((result, ex) -> {
+            scheduled.cancel(false);
+            if (ex != null) {
+                timeoutFuture.completeExceptionally(ex);
+            } else {
+                timeoutFuture.complete(result);
+            }
+        });
+
+        return timeoutFuture;
+    }
+
     public CompletableFuture<QueryResponse> query(String sqlQuery, Map<String, Object> queryParams) {
         return query(sqlQuery, queryParams, null);
     }
