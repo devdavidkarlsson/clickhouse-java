@@ -784,7 +784,10 @@ public class HttpAPIClientHelper {
             int errorCode = getHeaderVal(response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE),
                     0, Integer::parseInt);
 
-            return new ServerException(errorCode, errorBody, response.getCode(), null);
+            Header queryIdHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID);
+            String queryId = queryIdHeader != null ? queryIdHeader.getValue() : null;
+
+            return new ServerException(errorCode, errorBody, response.getCode(), queryId);
         } catch (Exception e) {
             return new ClientException("Failed to read error response", e);
         } finally {
