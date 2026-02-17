@@ -1965,24 +1965,42 @@ public class Client implements AutoCloseable {
             LOG.warn("Timeout scheduler not available - timeout will not be applied");
             return future;
         }
-        CompletableFuture<T> timeoutFuture = new CompletableFuture<>();
+
+        // Wrapper future that enforces timeout and propagates cancellation
+        CompletableFuture<T> resultFuture = new CompletableFuture<>();
+
         java.util.concurrent.ScheduledFuture<?> scheduled = scheduler.schedule(() -> {
-            if (!future.isDone()) {
-                timeoutFuture.completeExceptionally(
-                        new TimeoutException("Async operation timed out after " + timeoutMs + "ms"));
+            if (resultFuture.isDone()) {
+                return;
             }
+            // Complete the wrapper with a timeout and cancel the underlying operation
+            TimeoutException timeoutException =
+                    new TimeoutException("Async operation timed out after " + timeoutMs + "ms");
+            resultFuture.completeExceptionally(timeoutException);
+            future.cancel(true);
         }, timeoutMs, TimeUnit.MILLISECONDS);
 
-        future.whenComplete((result, ex) -> {
+        // When the underlying future completes first, propagate its result and cancel the timeout task
+        future.whenComplete((value, ex) -> {
+            if (resultFuture.isDone()) {
+                return;
+            }
             scheduled.cancel(false);
             if (ex != null) {
-                timeoutFuture.completeExceptionally(ex);
+                resultFuture.completeExceptionally(ex);
             } else {
-                timeoutFuture.complete(result);
+                resultFuture.complete(value);
             }
         });
 
-        return timeoutFuture;
+        // If callers cancel the wrapper, propagate cancellation to the underlying future
+        resultFuture.whenComplete((v, ex) -> {
+            if (resultFuture.isCancelled() && !future.isDone()) {
+                future.cancel(true);
+            }
+        });
+
+        return resultFuture;
     }
 
     public CompletableFuture<QueryResponse> query(String sqlQuery, Map<String, Object> queryParams) {
