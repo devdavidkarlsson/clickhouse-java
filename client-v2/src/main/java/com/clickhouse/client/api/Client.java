@@ -1901,16 +1901,31 @@ public class Client implements AutoCloseable {
                         throw new java.util.concurrent.CompletionException(wrappedException);
                     }
 
-                    if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE && attempt < retries) {
-                        LOG.warn("Failed to get response. Server returned {}. Retrying. (Duration: {})",
-                                response.getCode(), durationSince(startTime));
-                        // Close the streaming response before retrying to avoid resource leaks
-                        try {
-                            response.close();
-                        } catch (Exception closeEx) {
-                            LOG.debug("Failed to close streaming response before retry", closeEx);
+                    if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                        if (attempt < retries) {
+                            LOG.warn("Failed to get response. Server returned {}. Retrying. (Duration: {})",
+                                    response.getCode(), durationSince(startTime));
+                            // Close the streaming response before retrying to avoid resource leaks
+                            try {
+                                response.close();
+                            } catch (Exception closeEx) {
+                                LOG.debug("Failed to close streaming response before retry", closeEx);
+                            }
+                            return new AsyncRetryMarker(attempt + 1);
+                        } else {
+                            String msg = requestExMsg("Query", (attempt + 1),
+                                    durationSince(startTime).toMillis(), requestSettings.getQueryId());
+                            IOException cause = new IOException("Failed to get response. Server returned HTTP 503 (Service Unavailable).");
+                            RuntimeException wrappedException = httpClientHelper.wrapException(
+                                    msg, cause, requestSettings.getQueryId());
+                            // Close the streaming response before completing exceptionally
+                            try {
+                                response.close();
+                            } catch (Exception closeEx) {
+                                LOG.debug("Failed to close streaming response after retries exhausted", closeEx);
+                            }
+                            throw new java.util.concurrent.CompletionException(wrappedException);
                         }
-                        return new AsyncRetryMarker(attempt + 1);
                     }
 
                     OperationMetrics metrics = new OperationMetrics(clientStats);
