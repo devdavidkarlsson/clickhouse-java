@@ -1589,6 +1589,19 @@ public class Client implements AutoCloseable {
 
         return httpClientHelper.executeInsertAsyncStreaming(selectedEndpoint, requestSettings.getAllSettings(), data)
                 .thenApply(response -> {
+                    // Check for 503 Service Unavailable - async inserts don't support retry
+                    if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                        try {
+                            response.close();
+                        } catch (IOException closeEx) {
+                            LOG.debug("Failed to close 503 response", closeEx);
+                        }
+                        throw new java.util.concurrent.CompletionException(
+                                new ServerException(ServerException.CODE_UNKNOWN,
+                                        "Service Unavailable - async inserts do not support automatic retry",
+                                        HttpStatus.SC_SERVICE_UNAVAILABLE, requestSettings.getQueryId()));
+                    }
+
                     OperationMetrics metrics = new OperationMetrics(finalClientStats);
                     String summary = HttpAPIClientHelper.getHeaderVal(
                             response.getFirstHeader(ClickHouseHttpProto.HEADER_SRV_SUMMARY), "{}");
