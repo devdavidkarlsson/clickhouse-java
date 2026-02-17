@@ -382,6 +382,7 @@ public class AsyncHttpClientTests extends BaseIntegrationTest {
                 boolean cancelled = future.cancel(true);
 
                 // The future should be cancelled
+                Assert.assertTrue(cancelled, "Cancellation should return true");
                 Assert.assertTrue(future.isCancelled() || future.isDone());
 
             }
