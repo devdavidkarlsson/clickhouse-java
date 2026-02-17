@@ -36,7 +36,13 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     private static final int PIPE_BUFFER_SIZE = 512 * 1024; // 512KB pipe buffer
     private static final AtomicLong THREAD_COUNTER = new AtomicLong(0); // For unique thread names
 
-    // Shared thread pool for compression tasks - bounded to prevent thread explosion under high concurrency
+    /**
+     * Shared thread pool for compression tasks - bounded to prevent thread explosion under high concurrency.
+     * Uses daemon threads so it won't prevent JVM shutdown. This is intentionally static and shared
+     * across all StreamingAsyncEntityProducer instances to limit total thread count. The pool is not
+     * shut down explicitly - daemon threads will terminate when the JVM exits. This design provides
+     * efficient resource sharing while avoiding complex lifecycle management.
+     */
     private static final int COMPRESSION_POOL_SIZE = Math.max(2, Runtime.getRuntime().availableProcessors());
     private static final ExecutorService COMPRESSION_EXECUTOR = new ThreadPoolExecutor(
             COMPRESSION_POOL_SIZE,

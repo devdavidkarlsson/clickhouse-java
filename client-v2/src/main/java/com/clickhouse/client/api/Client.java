@@ -113,7 +113,13 @@ import java.util.stream.Collectors;
 public class Client implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(Client.class);
 
-    // Shared scheduler for async operation timeouts (Java 8 compatible alternative to orTimeout)
+    /**
+     * Shared scheduler for async operation timeouts (Java 8 compatible alternative to orTimeout).
+     * Uses daemon threads so it won't prevent JVM shutdown. This is intentionally static and
+     * not shut down explicitly - the daemon threads will terminate when the JVM exits.
+     * This design avoids complex lifecycle management while ensuring resources are not leaked
+     * beyond JVM termination.
+     */
     private static final java.util.concurrent.ScheduledExecutorService TIMEOUT_SCHEDULER =
             java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
                 Thread t = new Thread(r, "clickhouse-async-timeout");

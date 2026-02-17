@@ -265,8 +265,6 @@ public class AsyncHttpManualValidation {
             List<GenericRecord> records = client.queryAll("SELECT count() FROM " + tableName);
             long count = records.get(0).getLong(1);
 
-            client.query("DROP TABLE " + tableName).get(10, TimeUnit.SECONDS).close();
-
             if (count == 3) {
                 pass(testName + " (3 rows inserted)");
             } else {
@@ -274,7 +272,8 @@ public class AsyncHttpManualValidation {
             }
         } catch (Exception e) {
             fail(testName, e);
-            try { client.query("DROP TABLE IF EXISTS " + tableName).get(5, TimeUnit.SECONDS); } catch (Exception ignored) {}
+        } finally {
+            try { client.query("DROP TABLE IF EXISTS " + tableName).get(5, TimeUnit.SECONDS).close(); } catch (Exception ignored) {}
         }
     }
 
@@ -298,8 +297,6 @@ public class AsyncHttpManualValidation {
             List<GenericRecord> records = client.queryAll("SELECT count() FROM " + tableName);
             long count = records.get(0).getLong(1);
 
-            client.query("DROP TABLE " + tableName).get(10, TimeUnit.SECONDS).close();
-
             if (count == 10000) {
                 pass(testName + " (" + elapsed + "ms)");
             } else {
@@ -307,21 +304,24 @@ public class AsyncHttpManualValidation {
             }
         } catch (Exception e) {
             fail(testName, e);
-            try { client.query("DROP TABLE IF EXISTS " + tableName).get(5, TimeUnit.SECONDS); } catch (Exception ignored) {}
+        } finally {
+            try { client.query("DROP TABLE IF EXISTS " + tableName).get(5, TimeUnit.SECONDS).close(); } catch (Exception ignored) {}
         }
     }
 
     private static void testInsertWithCompression(Client client, String endpoint, String user, String pass) {
         String testName = "Insert with Compression";
         String tableName = "async_test_compress_" + System.currentTimeMillis();
-        try (Client compressClient = new Client.Builder()
-                .addEndpoint(endpoint)
-                .setUsername(user)
-                .setPassword(pass)
-                .useAsyncHttp(true)
-                .compressClientRequest(true)
-                .useHttpCompression(true)
-                .build()) {
+        Client compressClient = null;
+        try {
+            compressClient = new Client.Builder()
+                    .addEndpoint(endpoint)
+                    .setUsername(user)
+                    .setPassword(pass)
+                    .useAsyncHttp(true)
+                    .compressClientRequest(true)
+                    .useHttpCompression(true)
+                    .build();
 
             compressClient.query("CREATE TABLE " + tableName + " (id UInt64, value String) ENGINE = Memory")
                     .get(10, TimeUnit.SECONDS).close();
@@ -336,8 +336,6 @@ public class AsyncHttpManualValidation {
             List<GenericRecord> records = compressClient.queryAll("SELECT count() FROM " + tableName);
             long count = records.get(0).getLong(1);
 
-            compressClient.query("DROP TABLE " + tableName).get(10, TimeUnit.SECONDS).close();
-
             if (count == 1000) {
                 pass(testName + " (1000 rows)");
             } else {
@@ -345,6 +343,11 @@ public class AsyncHttpManualValidation {
             }
         } catch (Exception e) {
             fail(testName, e);
+        } finally {
+            if (compressClient != null) {
+                try { compressClient.query("DROP TABLE IF EXISTS " + tableName).get(5, TimeUnit.SECONDS).close(); } catch (Exception ignored) {}
+                try { compressClient.close(); } catch (Exception ignored) {}
+            }
         }
     }
 
