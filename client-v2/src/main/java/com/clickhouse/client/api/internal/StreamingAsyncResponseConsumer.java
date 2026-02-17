@@ -145,17 +145,23 @@ public class StreamingAsyncResponseConsumer extends AbstractBinResponseConsumer<
     private void closeOutputStream() {
         if (outputClosed.compareAndSet(false, true)) {
             LOG.debug("closeOutputStream() called, total bytes written: {}", totalBytesWritten);
+            Exception closeException = null;
             try {
                 pipedOutputStream.close();
-                if (streamError != null) {
-                    streamCompleteFuture.completeExceptionally(streamError);
-                    LOG.debug("closeOutputStream() completed with error");
-                } else {
-                    streamCompleteFuture.complete(null);
-                    LOG.debug("closeOutputStream() completed successfully");
-                }
             } catch (IOException e) {
                 LOG.debug("Error closing piped output stream: {}", e.getMessage());
+                closeException = e;
+            }
+            // Always complete the future, even if close() threw an exception
+            if (streamError != null) {
+                streamCompleteFuture.completeExceptionally(streamError);
+                LOG.debug("closeOutputStream() completed with stream error");
+            } else if (closeException != null) {
+                streamCompleteFuture.completeExceptionally(closeException);
+                LOG.debug("closeOutputStream() completed with close error");
+            } else {
+                streamCompleteFuture.complete(null);
+                LOG.debug("closeOutputStream() completed successfully");
             }
         } else {
             LOG.debug("closeOutputStream() already closed, skipping");

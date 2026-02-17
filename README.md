@@ -100,7 +100,7 @@ Client V2 supports true async HTTP using Apache HttpClient 5 NIO API for high-co
 - Non-blocking I/O - no thread-per-request blocking
 - Streaming responses with constant memory usage
 - Streaming request compression (HTTP and native LZ4)
-- 96-99% thread reduction under high concurrency
+- Substantial reduction in thread usage under high concurrency
 
 **Usage:**
 ```java

@@ -126,6 +126,11 @@ public class Client implements AutoCloseable {
             new java.util.concurrent.atomic.AtomicInteger(0);
     private static volatile java.util.concurrent.ScheduledExecutorService timeoutScheduler = null;
 
+    /**
+     * Thread-safety: Synchronizes on TIMEOUT_SCHEDULER_LOCK, ensuring mutual exclusion
+     * with releaseTimeoutScheduler(). No race condition exists because threads cannot
+     * concurrently execute acquire and release.
+     */
     private static void acquireTimeoutScheduler() {
         synchronized (TIMEOUT_SCHEDULER_LOCK) {
             if (TIMEOUT_SCHEDULER_REF_COUNT.getAndIncrement() == 0) {
@@ -139,6 +144,11 @@ public class Client implements AutoCloseable {
         }
     }
 
+    /**
+     * Thread-safety: Synchronizes on TIMEOUT_SCHEDULER_LOCK, ensuring mutual exclusion
+     * with acquireTimeoutScheduler(). The synchronized block guarantees that between
+     * checking the ref count and shutting down, no other thread can acquire a new reference.
+     */
     private static void releaseTimeoutScheduler() {
         synchronized (TIMEOUT_SCHEDULER_LOCK) {
             if (TIMEOUT_SCHEDULER_REF_COUNT.decrementAndGet() == 0 && timeoutScheduler != null) {
@@ -246,8 +256,18 @@ public class Client implements AutoCloseable {
         // Acquire shared async resources if async HTTP is enabled
         this.usesAsyncHttp = httpClientHelper.isAsyncEnabled();
         if (this.usesAsyncHttp) {
-            acquireTimeoutScheduler();
-            StreamingAsyncEntityProducer.acquireExecutor();
+            boolean timeoutSchedulerAcquired = false;
+            try {
+                acquireTimeoutScheduler();
+                timeoutSchedulerAcquired = true;
+                StreamingAsyncEntityProducer.acquireExecutor();
+            } catch (Exception e) {
+                // Release any acquired resources on failure to prevent leaks
+                if (timeoutSchedulerAcquired) {
+                    releaseTimeoutScheduler();
+                }
+                throw e;
+            }
         }
     }
 

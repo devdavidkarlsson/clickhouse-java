@@ -54,6 +54,10 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
      * Acquires a reference to the shared compression executor.
      * Call this when creating an async HTTP client that may use compression.
      * Must be paired with a call to {@link #releaseExecutor()} when the client is closed.
+     *
+     * <p>Thread-safety: This method synchronizes on EXECUTOR_LOCK, ensuring mutual exclusion
+     * with releaseExecutor(). No race condition exists because a thread cannot enter
+     * releaseExecutor() while another is in acquireExecutor() (and vice versa).</p>
      */
     public static void acquireExecutor() {
         synchronized (EXECUTOR_LOCK) {
@@ -67,6 +71,10 @@ public class StreamingAsyncEntityProducer implements AsyncEntityProducer {
     /**
      * Releases a reference to the shared compression executor.
      * When the last reference is released, the executor is gracefully shut down.
+     *
+     * <p>Thread-safety: This method synchronizes on EXECUTOR_LOCK, ensuring mutual exclusion
+     * with acquireExecutor(). The synchronized block guarantees that between checking the
+     * ref count and shutting down, no other thread can acquire a new reference.</p>
      */
     public static void releaseExecutor() {
         synchronized (EXECUTOR_LOCK) {
