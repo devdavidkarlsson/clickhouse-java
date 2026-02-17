@@ -6,9 +6,9 @@
         </encoder>
     </appender>
 
-    <!-- Enable debug for streaming consumer -->
-    <logger name="com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer" level="DEBUG"/>
-    <logger name="com.clickhouse.client.api.internal.HttpAPIClientHelper" level="DEBUG"/>
+    <!-- Enable info-level logging for streaming consumer and HTTP helper by default -->
+    <logger name="com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer" level="INFO"/>
+    <logger name="com.clickhouse.client.api.internal.HttpAPIClientHelper" level="INFO"/>
 
     <root level="INFO">
         <appender-ref ref="STDOUT"/>
