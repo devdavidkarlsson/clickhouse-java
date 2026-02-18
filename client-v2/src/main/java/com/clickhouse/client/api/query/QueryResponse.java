@@ -3,12 +3,16 @@ package com.clickhouse.client.api.query;
 import com.clickhouse.client.api.ClientConfigProperties;
 import com.clickhouse.client.api.ClientException;
 import com.clickhouse.client.api.http.ClickHouseHttpProto;
+import com.clickhouse.client.api.internal.StreamingAsyncResponseConsumer;
 import com.clickhouse.client.api.metrics.OperationMetrics;
 import com.clickhouse.client.api.metrics.ServerMetrics;
 import com.clickhouse.data.ClickHouseFormat;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.Header;
 
+import java.io.ByteArrayInputStream;
+import java.io.IOException;
 import java.io.InputStream;
 import java.util.TimeZone;
 
@@ -35,14 +39,56 @@ public class QueryResponse implements AutoCloseable {
 
     private ClassicHttpResponse httpResponse;
 
+    private byte[] bufferedResponseBody;
+
+    private InputStream streamingInputStream;
+
     public QueryResponse(ClassicHttpResponse response, ClickHouseFormat format, QuerySettings settings,
                          OperationMetrics operationMetrics) {
         this.httpResponse = response;
+        this.bufferedResponseBody = null;
         this.format = format;
         this.operationMetrics = operationMetrics;
         this.settings = settings;
 
-        Header tzHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE);
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    /**
+     * Constructor for async responses. Buffers entire response body in memory.
+     * For large result sets, use the streaming async API or sync API instead.
+     */
+    public QueryResponse(SimpleHttpResponse response, ClickHouseFormat format, QuerySettings settings,
+                         OperationMetrics operationMetrics) {
+        this.httpResponse = null;
+        // getBodyBytes() can return null for empty responses
+        byte[] bodyBytes = response.getBodyBytes();
+        this.bufferedResponseBody = bodyBytes != null ? bodyBytes : new byte[0];
+        this.streamingInputStream = null;
+        this.format = format;
+        this.operationMetrics = operationMetrics;
+        this.settings = settings;
+
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    /**
+     * Constructor for streaming async responses. Response body is streamed through a pipe,
+     * avoiding memory buffering. Suitable for large result sets.
+     */
+    public QueryResponse(StreamingAsyncResponseConsumer.StreamingResponse response, ClickHouseFormat format,
+                         QuerySettings settings, OperationMetrics operationMetrics) {
+        this.httpResponse = null;
+        this.bufferedResponseBody = null;
+        this.streamingInputStream = response.getInputStream();
+        this.format = format;
+        this.operationMetrics = operationMetrics;
+        this.settings = settings;
+
+        parseServerTimezone(response.getFirstHeader(ClickHouseHttpProto.HEADER_TIMEZONE));
+    }
+
+    private void parseServerTimezone(Header tzHeader) {
         if (tzHeader != null) {
             try {
                 this.settings.setOption(ClientConfigProperties.SERVER_TIMEZONE.getKey(),
@@ -55,20 +101,29 @@ public class QueryResponse implements AutoCloseable {
 
     public InputStream getInputStream() {
         try {
+            if (streamingInputStream != null) {
+                return streamingInputStream;
+            }
+            if (bufferedResponseBody != null) {
+                return new ByteArrayInputStream(bufferedResponseBody);
+            }
             return httpResponse.getEntity().getContent();
         } catch (Exception e) {
             throw new ClientException("Failed to construct input stream", e);
         }
     }
 
+    /**
+     * Closes this response and releases associated resources.
+     * IOExceptions are propagated as-is to maintain AutoCloseable contract consistency.
+     */
     @Override
     public void close() throws Exception {
-        if (httpResponse != null ) {
-            try {
-                httpResponse.close();
-            } catch (Exception e) {
-                throw new ClientException("Failed to close response", e);
-            }
+        if (streamingInputStream != null) {
+            streamingInputStream.close();
+        }
+        if (httpResponse != null) {
+            httpResponse.close();
         }
     }
 

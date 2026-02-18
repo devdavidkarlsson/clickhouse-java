@@ -18,23 +18,32 @@ import com.clickhouse.data.ClickHouseFormat;
 import net.jpountz.lz4.LZ4Factory;
 import org.apache.commons.compress.compressors.CompressorStreamFactory;
 import org.apache.hc.client5.http.ConnectTimeoutException;
+import org.apache.hc.client5.http.async.methods.SimpleHttpRequest;
+import org.apache.hc.client5.http.async.methods.SimpleHttpResponse;
+import org.apache.hc.client5.http.async.methods.SimpleRequestBuilder;
 import org.apache.hc.client5.http.classic.methods.HttpPost;
 import org.apache.hc.client5.http.config.ConnectionConfig;
 import org.apache.hc.client5.http.config.RequestConfig;
 import org.apache.hc.client5.http.entity.mime.MultipartEntityBuilder;
 import org.apache.hc.client5.http.entity.mime.MultipartPartBuilder;
+import org.apache.hc.client5.http.impl.async.CloseableHttpAsyncClient;
+import org.apache.hc.client5.http.impl.async.HttpAsyncClientBuilder;
+import org.apache.hc.client5.http.impl.async.HttpAsyncClients;
 import org.apache.hc.client5.http.impl.classic.CloseableHttpClient;
 import org.apache.hc.client5.http.impl.classic.HttpClientBuilder;
 import org.apache.hc.client5.http.impl.io.BasicHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.ManagedHttpClientConnectionFactory;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManagerBuilder;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManagerBuilder;
 import org.apache.hc.client5.http.io.HttpClientConnectionManager;
 import org.apache.hc.client5.http.io.ManagedHttpClientConnection;
 import org.apache.hc.client5.http.protocol.HttpClientContext;
 import org.apache.hc.client5.http.socket.ConnectionSocketFactory;
 import org.apache.hc.client5.http.socket.LayeredConnectionSocketFactory;
 import org.apache.hc.client5.http.socket.PlainConnectionSocketFactory;
+import org.apache.hc.client5.http.ssl.ClientTlsStrategyBuilder;
 import org.apache.hc.client5.http.ssl.SSLConnectionSocketFactory;
 import org.apache.hc.core5.http.ClassicHttpResponse;
 import org.apache.hc.core5.http.ConnectionRequestTimeoutException;
@@ -45,22 +54,32 @@ import org.apache.hc.core5.http.HttpHeaders;
 import org.apache.hc.core5.http.HttpHost;
 import org.apache.hc.core5.http.HttpRequest;
 import org.apache.hc.core5.http.HttpStatus;
+import org.apache.hc.core5.http.message.BasicHttpRequest;
 import org.apache.hc.core5.http.NoHttpResponseException;
 import org.apache.hc.core5.http.config.CharCodingConfig;
 import org.apache.hc.core5.http.config.Http1Config;
 import org.apache.hc.core5.http.config.RegistryBuilder;
 import org.apache.hc.core5.http.impl.io.DefaultHttpResponseParserFactory;
 import org.apache.hc.core5.http.io.SocketConfig;
+import org.apache.hc.core5.concurrent.FutureCallback;
 import org.apache.hc.core5.http.io.entity.ByteArrayEntity;
 import org.apache.hc.core5.http.io.entity.EntityTemplate;
+import org.apache.hc.core5.http.nio.AsyncEntityProducer;
+import org.apache.hc.core5.http.nio.AsyncRequestProducer;
+import org.apache.hc.core5.http.nio.entity.BasicAsyncEntityProducer;
+import org.apache.hc.core5.http.nio.ssl.TlsStrategy;
+import org.apache.hc.core5.http.nio.support.BasicRequestProducer;
 import org.apache.hc.core5.http.protocol.HttpContext;
+import org.apache.hc.core5.http.ssl.TLS;
 import org.apache.hc.core5.io.CloseMode;
 import org.apache.hc.core5.io.IOCallback;
 import org.apache.hc.core5.net.URIBuilder;
 import org.apache.hc.core5.pool.ConnPoolControl;
 import org.apache.hc.core5.pool.PoolConcurrencyPolicy;
 import org.apache.hc.core5.pool.PoolReusePolicy;
+import org.apache.hc.core5.reactor.IOReactorConfig;
 import org.apache.hc.core5.util.TimeValue;
+import org.apache.hc.core5.util.Timeout;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -96,8 +115,11 @@ import java.util.Objects;
 import java.util.Optional;
 import java.util.Properties;
 import java.util.Set;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.Future;
 import java.util.concurrent.ConcurrentLinkedQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.function.BiConsumer;
 import java.util.function.Function;
@@ -116,7 +138,11 @@ public class HttpAPIClientHelper {
     private static final Pattern PATTERN_HEADER_VALUE_ASCII = Pattern.compile(
         "\\p{Graph}+(?:[ ]\\p{Graph}+)*");
 
+    private static final ContentType CONTENT_TYPE = ContentType.create(ContentType.TEXT_PLAIN.getMimeType(), "UTF-8");
+
     private final CloseableHttpClient httpClient;
+    private final CloseableHttpAsyncClient httpAsyncClient;
+    private final AtomicBoolean asyncClientClosed = new AtomicBoolean(false);
 
     private String proxyAuthHeaderValue;
 
@@ -147,6 +173,26 @@ public class HttpAPIClientHelper {
         }
 
         this.defaultUserAgent = buildDefaultUserAgent();
+
+        // Initialize async client
+        boolean useAsyncHttp = ClientConfigProperties.USE_ASYNC_HTTP.getOrDefault(configuration);
+        if (useAsyncHttp) {
+            try {
+                CloseableHttpAsyncClient asyncClient = createHttpAsyncClient(initSslContext, configuration);
+                asyncClient.start();
+                this.httpAsyncClient = asyncClient;
+                LOG.info("Async HTTP client initialized and started");
+            } catch (RuntimeException | Error e) {
+                try {
+                    this.httpClient.close();
+                } catch (IOException closeEx) {
+                    e.addSuppressed(closeEx);
+                }
+                throw e;
+            }
+        } else {
+            this.httpAsyncClient = null;
+        }
     }
 
     /**
@@ -339,6 +385,84 @@ public class HttpAPIClientHelper {
         return clientBuilder.build();
     }
 
+    public CloseableHttpAsyncClient createHttpAsyncClient(boolean initSslContext, Map<String, Object> configuration) {
+        HttpAsyncClientBuilder asyncBuilder = HttpAsyncClients.custom();
+
+        SSLContext sslContext = initSslContext ? createSSLContext(configuration) : null;
+
+        IOReactorConfig.Builder ioReactorBuilder = IOReactorConfig.custom();
+        ClientConfigProperties.SOCKET_OPERATION_TIMEOUT.<Integer>applyIfSet(configuration,
+                (t) -> ioReactorBuilder.setSoTimeout(Timeout.ofMilliseconds(t)));
+        ClientConfigProperties.SOCKET_RCVBUF_OPT.applyIfSet(configuration,
+                ioReactorBuilder::setRcvBufSize);
+        ClientConfigProperties.SOCKET_SNDBUF_OPT.applyIfSet(configuration,
+                ioReactorBuilder::setSndBufSize);
+        ClientConfigProperties.SOCKET_LINGER_OPT.<Integer>applyIfSet(configuration,
+                (v) -> ioReactorBuilder.setSoLinger(TimeValue.ofSeconds(v)));
+        ClientConfigProperties.SOCKET_TCP_NO_DELAY_OPT.applyIfSet(configuration,
+                ioReactorBuilder::setTcpNoDelay);
+        asyncBuilder.setIOReactorConfig(ioReactorBuilder.build());
+
+        PoolingAsyncClientConnectionManagerBuilder connMgrBuilder = PoolingAsyncClientConnectionManagerBuilder.create();
+        connMgrBuilder.setPoolConcurrencyPolicy(PoolConcurrencyPolicy.LAX);
+
+        ConnectionReuseStrategy connectionReuseStrategy = ClientConfigProperties.CONNECTION_REUSE_STRATEGY.getOrDefault(configuration);
+        switch (connectionReuseStrategy) {
+            case LIFO:
+                connMgrBuilder.setConnPoolPolicy(PoolReusePolicy.LIFO);
+                break;
+            case FIFO:
+                connMgrBuilder.setConnPoolPolicy(PoolReusePolicy.FIFO);
+                break;
+            default:
+                throw new ClientMisconfigurationException("Unknown connection reuse strategy: " + connectionReuseStrategy);
+        }
+
+        connMgrBuilder.setMaxConnTotal(Integer.MAX_VALUE);
+        ClientConfigProperties.HTTP_MAX_OPEN_CONNECTIONS.applyIfSet(configuration, connMgrBuilder::setMaxConnPerRoute);
+        connMgrBuilder.setDefaultConnectionConfig(createConnectionConfig(configuration));
+
+        if (sslContext != null) {
+            TlsStrategy tlsStrategy = ClientTlsStrategyBuilder.create()
+                    .setSslContext(sslContext)
+                    .setTlsVersions(TLS.V_1_2, TLS.V_1_3)
+                    .build();
+            connMgrBuilder.setTlsStrategy(tlsStrategy);
+        }
+
+        PoolingAsyncClientConnectionManager asyncConnMgr = connMgrBuilder.build();
+        asyncBuilder.setConnectionManager(asyncConnMgr);
+
+        // Register metrics for async connection pool
+        if (metricsRegistry != null) {
+            try {
+                String mGroupName = ClientConfigProperties.METRICS_GROUP_NAME.getOrDefault(configuration);
+                Class<?> micrometerLoader = getClass().getClassLoader().loadClass("com.clickhouse.client.api.metrics.MicrometerLoader");
+                Method applyMethod = micrometerLoader.getDeclaredMethod("applyAsyncPoolingMetricsBinder",
+                        Object.class, String.class, PoolingAsyncClientConnectionManager.class);
+                applyMethod.invoke(micrometerLoader, metricsRegistry, mGroupName, asyncConnMgr);
+            } catch (Exception e) {
+                LOG.error("Failed to register async connection pool metrics", e);
+            }
+        }
+
+        String proxyHost = (String) configuration.get(ClientConfigProperties.PROXY_HOST.getKey());
+        Integer proxyPort = (Integer) configuration.get(ClientConfigProperties.PROXY_PORT.getKey());
+        String proxyTypeVal = (String) configuration.get(ClientConfigProperties.PROXY_TYPE.getKey());
+        ProxyType proxyType = proxyTypeVal == null ? null : ProxyType.valueOf(proxyTypeVal);
+
+        if (proxyType == ProxyType.HTTP && proxyHost != null && proxyPort != null) {
+            asyncBuilder.setProxy(new HttpHost(proxyHost, proxyPort));
+        }
+
+        boolean disableCookies = !((Boolean) ClientConfigProperties.HTTP_SAVE_COOKIES.getOrDefault(configuration));
+        if (disableCookies) {
+            asyncBuilder.disableCookieManagement();
+        }
+
+        return asyncBuilder.build();
+    }
+
 //    private static final String ERROR_CODE_PREFIX_PATTERN = "Code: %d. DB::Exception:";
     private static final String ERROR_CODE_PREFIX_PATTERN = "%d. DB::Exception:";
 
@@ -480,6 +604,478 @@ public class HttpAPIClientHelper {
         return doPostRequest(requestConfig, req);
     }
 
+    /**
+     * Executes an HTTP request asynchronously. Buffers entire response body in memory.
+     * For large result sets, use the streaming sync API instead.
+     */
+    public CompletableFuture<SimpleHttpResponse> executeRequestAsync(Endpoint server,
+                                                                     Map<String, Object> requestConfig,
+                                                                     String body) {
+        if (httpAsyncClient == null) {
+            throw new ClientException("Async HTTP client is not enabled. Set USE_ASYNC_HTTP to true.");
+        }
+
+        final URI uri = createRequestURI(server, requestConfig, true);
+        final SimpleHttpRequest request = createSimpleHttpRequest(uri, requestConfig, body);
+
+        CompletableFuture<SimpleHttpResponse> future = new CompletableFuture<>();
+
+        Future<SimpleHttpResponse> httpFuture = httpAsyncClient.execute(request, new FutureCallback<SimpleHttpResponse>() {
+            @Override
+            public void completed(SimpleHttpResponse response) {
+                try {
+                    if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                        future.completeExceptionally(new ClientMisconfigurationException(
+                                "Proxy authentication required. Please check your proxy settings."));
+                        return;
+                    } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                        future.completeExceptionally(new ClientException(
+                                "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                        return;
+                    } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                        // Return 503 normally - let caller handle retry logic
+                        future.complete(response);
+                        return;
+                    } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
+                               response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                        future.completeExceptionally(readErrorFromAsyncResponse(response));
+                        return;
+                    }
+                    future.complete(response);
+                } catch (Exception e) {
+                    future.completeExceptionally(e);
+                }
+            }
+
+            @Override
+            public void failed(Exception ex) {
+                LOG.debug("Async request failed to '{}': {}", uri, ex.getMessage(), ex);
+                future.completeExceptionally(ex);
+            }
+
+            @Override
+            public void cancelled() {
+                future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
+            }
+        });
+
+        return future;
+    }
+
+    /**
+     * Executes an HTTP request asynchronously with streaming response.
+     * Response body is streamed through a PipedInputStream, avoiding memory buffering.
+     * Suitable for large result sets.
+     *
+     * <p>IMPORTANT: The returned future completes as soon as HTTP headers are received,
+     * NOT when all data has been transferred. This allows the caller to start reading
+     * from the stream immediately, preventing deadlock.</p>
+     */
+    public CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> executeRequestAsyncStreaming(
+            Endpoint server,
+            Map<String, Object> requestConfig,
+            String body) {
+        if (httpAsyncClient == null) {
+            throw new ClientException("Async HTTP client is not enabled. Set USE_ASYNC_HTTP to true.");
+        }
+
+        final URI uri = createRequestURI(server, requestConfig, true);
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+
+        // Apply compression if configured (acceptable for queries which are small payloads)
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
+        if (clientCompression && !appCompressedData) {
+            int bufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+            bodyBytes = compressLZ4(bodyBytes, useHttpCompression, bufferSize);
+            LOG.debug("Async request compressed: {} -> {} bytes", body.length(), bodyBytes.length);
+        }
+
+        BasicHttpRequest request = new BasicHttpRequest("POST", uri);
+        addHeadersToRequest(request, requestConfig);
+
+        AsyncEntityProducer entityProducer = new BasicAsyncEntityProducer(bodyBytes, CONTENT_TYPE);
+        AsyncRequestProducer requestProducer = new BasicRequestProducer(request, entityProducer);
+
+        StreamingAsyncResponseConsumer responseConsumer = new StreamingAsyncResponseConsumer();
+
+        CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> future = new CompletableFuture<>();
+
+        // Complete future when headers arrive (via headersFuture), NOT when stream ends.
+        // This prevents deadlock: user can start reading while NIO thread writes.
+        responseConsumer.getHeadersFuture().whenComplete((response, headerEx) -> {
+            if (headerEx != null) {
+                future.completeExceptionally(headerEx);
+                return;
+            }
+
+            try {
+                if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                    closeStreamingResponse(response);
+                    future.completeExceptionally(new ClientMisconfigurationException(
+                            "Proxy authentication required. Please check your proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                    closeStreamingResponse(response);
+                    future.completeExceptionally(new ClientException(
+                            "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                    // Return 503 normally - let caller handle retry logic
+                    future.complete(response);
+                } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
+                           response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                    // readErrorFromStreamingResponse closes the response
+                    future.completeExceptionally(readErrorFromStreamingResponse(response));
+                } else {
+                    future.complete(response);
+                }
+            } catch (Exception e) {
+                closeStreamingResponse(response);
+                future.completeExceptionally(e);
+            }
+        });
+
+        Future<StreamingAsyncResponseConsumer.StreamingResponse> httpFuture = httpAsyncClient.execute(
+                requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
+            @Override
+            public void completed(StreamingAsyncResponseConsumer.StreamingResponse response) {
+                // Stream has ended. Future should already be completed via headersFuture.
+                LOG.debug("Async streaming request completed for '{}'", uri);
+            }
+
+            @Override
+            public void failed(Exception ex) {
+                LOG.debug("Async streaming request failed to '{}': {}", uri, ex.getMessage(), ex);
+                // Complete future exceptionally if not already done
+                future.completeExceptionally(ex);
+            }
+
+            @Override
+            public void cancelled() {
+                future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
+            }
+        });
+
+        return future;
+    }
+
+    private Exception readErrorFromStreamingResponse(StreamingAsyncResponseConsumer.StreamingResponse response) {
+        try {
+            InputStream is = response.getInputStream();
+            byte[] errorBytes = new byte[ERROR_BODY_BUFFER_SIZE];
+            int bytesRead = is.read(errorBytes, 0, ERROR_BODY_BUFFER_SIZE);
+            String errorBody = bytesRead > 0 ? new String(errorBytes, 0, bytesRead, StandardCharsets.UTF_8) : "";
+
+            int errorCode = getHeaderVal(response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE),
+                    0, Integer::parseInt);
+
+            Header queryIdHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID);
+            String queryId = queryIdHeader != null ? queryIdHeader.getValue() : null;
+
+            return new ServerException(errorCode, errorBody, response.getCode(), queryId);
+        } catch (Exception e) {
+            return new ClientException("Failed to read error response", e);
+        } finally {
+            try {
+                response.close();
+            } catch (IOException e) {
+                LOG.debug("Failed to close streaming response after reading error", e);
+            }
+        }
+    }
+
+    private void closeStreamingResponse(StreamingAsyncResponseConsumer.StreamingResponse response) {
+        try {
+            response.close();
+        } catch (IOException e) {
+            LOG.debug("Failed to close streaming response", e);
+        }
+    }
+
+    /**
+     * Compresses data using LZ4 compression.
+     *
+     * @param data the uncompressed data
+     * @param useHttpCompression if true, uses framed LZ4 (HTTP Content-Encoding compatible);
+     *                           if false, uses ClickHouse native LZ4 format
+     * @param bufferSize buffer size for compression
+     * @return compressed data
+     */
+    private byte[] compressLZ4(byte[] data, boolean useHttpCompression, int bufferSize) {
+        try {
+            java.io.ByteArrayOutputStream baos = new java.io.ByteArrayOutputStream();
+            OutputStream compressingStream;
+
+            if (useHttpCompression) {
+                compressingStream = new org.apache.commons.compress.compressors.lz4.FramedLZ4CompressorOutputStream(baos);
+            } else {
+                compressingStream = new ClickHouseLZ4OutputStream(baos, lz4Factory.fastCompressor(), bufferSize);
+            }
+
+            try {
+                compressingStream.write(data);
+            } finally {
+                compressingStream.close();
+            }
+
+            return baos.toByteArray();
+        } catch (IOException e) {
+            throw new ClientException("Failed to compress request data", e);
+        }
+    }
+
+    /**
+     * Executes an async insert request with streaming body and optional compression.
+     * Data is streamed from the InputStream with on-the-fly compression, avoiding
+     * buffering the entire payload in memory.
+     *
+     * @param server target endpoint
+     * @param requestConfig request configuration
+     * @param dataStream input stream containing data to insert
+     * @return future that completes when headers are received (streaming continues in background)
+     */
+    public CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> executeInsertAsyncStreaming(
+            Endpoint server,
+            Map<String, Object> requestConfig,
+            InputStream dataStream) {
+        if (httpAsyncClient == null) {
+            throw new ClientException("Async HTTP client is not enabled. Set USE_ASYNC_HTTP to true.");
+        }
+
+        final URI uri = createRequestURI(server, requestConfig, true);
+
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+        int compressionBufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+
+        boolean shouldCompress = clientCompression && !appCompressedData;
+
+        BasicHttpRequest request = new BasicHttpRequest("POST", uri);
+        addHeadersToRequest(request, requestConfig);
+
+        StreamingAsyncEntityProducer entityProducer = new StreamingAsyncEntityProducer(
+                dataStream, CONTENT_TYPE,
+                shouldCompress, useHttpCompression,
+                compressionBufferSize, lz4Factory);
+
+        AsyncRequestProducer requestProducer = new BasicRequestProducer(request, entityProducer);
+        StreamingAsyncResponseConsumer responseConsumer = new StreamingAsyncResponseConsumer();
+
+        CompletableFuture<StreamingAsyncResponseConsumer.StreamingResponse> future = new CompletableFuture<>();
+
+        responseConsumer.getHeadersFuture().whenComplete((response, headerEx) -> {
+            if (headerEx != null) {
+                future.completeExceptionally(headerEx);
+                return;
+            }
+
+            try {
+                if (response.getCode() == HttpStatus.SC_PROXY_AUTHENTICATION_REQUIRED) {
+                    closeStreamingResponse(response);
+                    future.completeExceptionally(new ClientMisconfigurationException(
+                            "Proxy authentication required. Please check your proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_BAD_GATEWAY) {
+                    closeStreamingResponse(response);
+                    future.completeExceptionally(new ClientException(
+                            "Server returned '502 Bad gateway'. Check network and proxy settings."));
+                } else if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                    // Return 503 normally - let caller handle retry logic
+                    future.complete(response);
+                } else if (response.getCode() >= HttpStatus.SC_BAD_REQUEST ||
+                           response.containsHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE)) {
+                    // readErrorFromStreamingResponse closes the response
+                    future.completeExceptionally(readErrorFromStreamingResponse(response));
+                } else {
+                    future.complete(response);
+                }
+            } catch (Exception e) {
+                closeStreamingResponse(response);
+                future.completeExceptionally(e);
+            }
+        });
+
+        Future<StreamingAsyncResponseConsumer.StreamingResponse> httpFuture = httpAsyncClient.execute(
+                requestProducer, responseConsumer, new FutureCallback<StreamingAsyncResponseConsumer.StreamingResponse>() {
+            @Override
+            public void completed(StreamingAsyncResponseConsumer.StreamingResponse response) {
+                LOG.debug("Async insert request completed for '{}'", uri);
+            }
+
+            @Override
+            public void failed(Exception ex) {
+                LOG.debug("Async insert request failed to '{}': {}", uri, ex.getMessage(), ex);
+                future.completeExceptionally(ex);
+            }
+
+            @Override
+            public void cancelled() {
+                future.cancel(true);
+            }
+        });
+
+        // Propagate cancellation to the underlying HTTP request
+        future.whenComplete((result, ex) -> {
+            if (future.isCancelled()) {
+                httpFuture.cancel(true);
+            }
+        });
+
+        return future;
+    }
+
+    private SimpleHttpRequest createSimpleHttpRequest(URI uri, Map<String, Object> requestConfig, String body) {
+        byte[] bodyBytes = body.getBytes(StandardCharsets.UTF_8);
+
+        // Apply compression if configured
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
+        if (clientCompression && !appCompressedData) {
+            int bufferSize = ClientConfigProperties.COMPRESSION_LZ4_UNCOMPRESSED_BUF_SIZE.getOrDefault(requestConfig);
+            bodyBytes = compressLZ4(bodyBytes, useHttpCompression, bufferSize);
+            LOG.debug("Async simple request compressed: {} -> {} bytes", body.length(), bodyBytes.length);
+        }
+
+        SimpleRequestBuilder builder = SimpleRequestBuilder.post(uri)
+                .setBody(bodyBytes, CONTENT_TYPE);
+        addHeadersToSimpleRequest(builder, requestConfig);
+        return builder.build();
+    }
+
+    private void addHeadersToSimpleRequest(SimpleRequestBuilder builder, Map<String, Object> requestConfig) {
+        builder.setHeader(HttpHeaders.CONTENT_TYPE, CONTENT_TYPE.getMimeType());
+
+        if (requestConfig.containsKey(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey())) {
+            builder.setHeader(ClickHouseHttpProto.HEADER_FORMAT,
+                    ((ClickHouseFormat) requestConfig.get(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey())).name());
+        }
+        if (requestConfig.containsKey(ClientConfigProperties.QUERY_ID.getKey())) {
+            builder.setHeader(ClickHouseHttpProto.HEADER_QUERY_ID,
+                    (String) requestConfig.get(ClientConfigProperties.QUERY_ID.getKey()));
+        }
+        builder.setHeader(ClickHouseHttpProto.HEADER_DATABASE,
+                ClientConfigProperties.DATABASE.getOrDefault(requestConfig));
+
+        // Check if custom Authorization header is set
+        String customAuthHeaderKey = ClientConfigProperties.HTTP_HEADER_PREFIX + HttpHeaders.AUTHORIZATION;
+        boolean hasCustomAuth = requestConfig.containsKey(customAuthHeaderKey) &&
+                                requestConfig.get(customAuthHeaderKey) != null;
+
+        if (ClientConfigProperties.SSL_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
+            if (!hasCustomAuth) {
+                builder.setHeader(ClickHouseHttpProto.HEADER_DB_USER,
+                        ClientConfigProperties.USER.getOrDefault(requestConfig));
+            }
+            builder.setHeader(ClickHouseHttpProto.HEADER_SSL_CERT_AUTH, "on");
+        } else if (ClientConfigProperties.HTTP_USE_BASIC_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
+            String user = ClientConfigProperties.USER.getOrDefault(requestConfig);
+            String password = ClientConfigProperties.PASSWORD.getOrDefault(requestConfig);
+            builder.addHeader(HttpHeaders.AUTHORIZATION,
+                    "Basic " + Base64.getEncoder().encodeToString(
+                            (user + ":" + password).getBytes(StandardCharsets.UTF_8)));
+        } else if (!hasCustomAuth) {
+            // Only set CH auth headers if no custom Authorization header is provided
+            builder.setHeader(ClickHouseHttpProto.HEADER_DB_USER,
+                    ClientConfigProperties.USER.getOrDefault(requestConfig));
+            String password = ClientConfigProperties.PASSWORD.getOrDefault(requestConfig);
+            if (password != null && !password.isEmpty()) {
+                builder.setHeader(ClickHouseHttpProto.HEADER_DB_PASSWORD, password);
+            }
+        }
+
+        if (proxyAuthHeaderValue != null) {
+            builder.addHeader(HttpHeaders.PROXY_AUTHORIZATION, proxyAuthHeaderValue);
+        }
+
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean serverCompression = ClientConfigProperties.COMPRESS_SERVER_RESPONSE.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+        if (useHttpCompression) {
+            if (serverCompression) {
+                builder.setHeader(HttpHeaders.ACCEPT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+            }
+            if (clientCompression && !appCompressedData) {
+                builder.setHeader(HttpHeaders.CONTENT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+            }
+        }
+
+        for (String key : requestConfig.keySet()) {
+            if (key.startsWith(ClientConfigProperties.HTTP_HEADER_PREFIX)) {
+                Object val = requestConfig.get(key);
+                if (val != null) {
+                    builder.setHeader(key.substring(ClientConfigProperties.HTTP_HEADER_PREFIX.length()),
+                            String.valueOf(val));
+                }
+            }
+        }
+
+        String clientName = ClientConfigProperties.CLIENT_NAME.getOrDefault(requestConfig);
+        String userAgentValue = defaultUserAgent;
+        if (clientName != null && !clientName.isEmpty()) {
+            userAgentValue = clientName + " " + defaultUserAgent;
+        }
+        builder.setHeader(HttpHeaders.USER_AGENT, userAgentValue);
+    }
+
+    private Exception readErrorFromAsyncResponse(SimpleHttpResponse response) {
+        Header qIdHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID);
+        final String queryId = qIdHeader == null ? "" : qIdHeader.getValue();
+        Header codeHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_EXCEPTION_CODE);
+        int serverCode = 0;
+        if (codeHeader != null) {
+            try {
+                serverCode = Integer.parseInt(codeHeader.getValue());
+            } catch (NumberFormatException nfe) {
+                LOG.warn("Failed to parse exception code header value '{}' as integer; using 0 instead",
+                        codeHeader.getValue());
+                serverCode = 0;
+            }
+        }
+
+        String msg;
+        try {
+            byte[] bodyBytes = response.getBodyBytes();
+            if (bodyBytes != null && bodyBytes.length > 0) {
+                String bodyText = new String(bodyBytes, StandardCharsets.UTF_8);
+                msg = bodyText.replaceAll("\\s+", " ").replaceAll("\\\\n", " ").replaceAll("\\\\/", "/");
+                if (msg.trim().isEmpty()) {
+                    msg = String.format(ERROR_CODE_PREFIX_PATTERN, serverCode) +
+                            " <Unreadable error message> (transport error: " + response.getCode() + ")";
+                }
+            } else {
+                msg = String.format(ERROR_CODE_PREFIX_PATTERN, serverCode) +
+                        " <Empty response body> (transport error: " + response.getCode() + ")";
+            }
+        } catch (Exception e) {
+            LOG.error("Failed to read error message from async response", e);
+            msg = String.format(ERROR_CODE_PREFIX_PATTERN, serverCode) +
+                    " <Unreadable error message> (transport error: " + response.getCode() + ")";
+        }
+        return new ServerException(serverCode, "Code: " + msg + " (queryId= " + queryId + ")", response.getCode(), queryId);
+    }
+
+    public boolean isAsyncEnabled() {
+        return httpAsyncClient != null;
+    }
+
     public ClassicHttpResponse executeMultiPartRequest(Endpoint server, Map<String, Object> requestConfig, String sqlQuery) throws Exception {
 
         requestConfig.put(ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getKey(), false);
@@ -565,8 +1161,6 @@ public class HttpAPIClientHelper {
             }
         }
     }
-
-    private static final ContentType CONTENT_TYPE = ContentType.create(ContentType.TEXT_PLAIN.getMimeType(), "UTF-8");
 
     private void addHeaders(HttpPost req, Map<String, Object> requestConfig) {
         setHeader(req, HttpHeaders.CONTENT_TYPE, CONTENT_TYPE.getMimeType());
@@ -658,6 +1252,69 @@ public class HttpAPIClientHelper {
         }
 
         // -- keep last
+        correctUserAgentHeader(req, requestConfig);
+    }
+
+    private void addHeadersToRequest(HttpRequest req, Map<String, Object> requestConfig) {
+        setHeader(req, HttpHeaders.CONTENT_TYPE, CONTENT_TYPE.getMimeType());
+        if (requestConfig.containsKey(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey())) {
+            setHeader(req, ClickHouseHttpProto.HEADER_FORMAT,
+                    ((ClickHouseFormat) requestConfig.get(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey())).name());
+        }
+        if (requestConfig.containsKey(ClientConfigProperties.QUERY_ID.getKey())) {
+            setHeader(req, ClickHouseHttpProto.HEADER_QUERY_ID,
+                    (String) requestConfig.get(ClientConfigProperties.QUERY_ID.getKey()));
+        }
+        setHeader(req, ClickHouseHttpProto.HEADER_DATABASE, ClientConfigProperties.DATABASE.getOrDefault(requestConfig));
+
+        if (ClientConfigProperties.SSL_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
+            setHeader(req, ClickHouseHttpProto.HEADER_DB_USER, ClientConfigProperties.USER.getOrDefault(requestConfig));
+            setHeader(req, ClickHouseHttpProto.HEADER_SSL_CERT_AUTH, "on");
+        } else if (ClientConfigProperties.HTTP_USE_BASIC_AUTH.<Boolean>getOrDefault(requestConfig).booleanValue()) {
+            String user = ClientConfigProperties.USER.getOrDefault(requestConfig);
+            String password = ClientConfigProperties.PASSWORD.getOrDefault(requestConfig);
+            req.addHeader(HttpHeaders.AUTHORIZATION,
+                    "Basic " + Base64.getEncoder().encodeToString((user + ":" + password).getBytes(StandardCharsets.UTF_8)));
+        } else {
+            setHeader(req, ClickHouseHttpProto.HEADER_DB_USER, ClientConfigProperties.USER.getOrDefault(requestConfig));
+            setHeader(req, ClickHouseHttpProto.HEADER_DB_PASSWORD, ClientConfigProperties.PASSWORD.getOrDefault(requestConfig));
+        }
+
+        if (proxyAuthHeaderValue != null) {
+            req.addHeader(HttpHeaders.PROXY_AUTHORIZATION, proxyAuthHeaderValue);
+        }
+
+        boolean clientCompression = ClientConfigProperties.COMPRESS_CLIENT_REQUEST.getOrDefault(requestConfig);
+        boolean serverCompression = ClientConfigProperties.COMPRESS_SERVER_RESPONSE.getOrDefault(requestConfig);
+        boolean useHttpCompression = ClientConfigProperties.USE_HTTP_COMPRESSION.getOrDefault(requestConfig);
+        boolean appCompressedData = ClientConfigProperties.APP_COMPRESSED_DATA.getOrDefault(requestConfig);
+
+        if (useHttpCompression && serverCompression) {
+            setHeader(req, HttpHeaders.ACCEPT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+        }
+        if (useHttpCompression && clientCompression && !appCompressedData) {
+            setHeader(req, HttpHeaders.CONTENT_ENCODING, DEFAULT_HTTP_COMPRESSION_ALGO);
+        }
+
+        for (String key : requestConfig.keySet()) {
+            if (key.startsWith(ClientConfigProperties.HTTP_HEADER_PREFIX)) {
+                Object val = requestConfig.get(key);
+                if (val != null) {
+                    setHeader(req, key.substring(ClientConfigProperties.HTTP_HEADER_PREFIX.length()), String.valueOf(val));
+                }
+            }
+        }
+
+        // Special cases - match sync addHeaders behavior
+        if (req.containsHeader(HttpHeaders.AUTHORIZATION)
+            && (req.containsHeader(ClickHouseHttpProto.HEADER_DB_USER) ||
+                req.containsHeader(ClickHouseHttpProto.HEADER_DB_PASSWORD)))
+        {
+            // user has set auth header for purpose, lets remove ours
+            req.removeHeaders(ClickHouseHttpProto.HEADER_DB_USER);
+            req.removeHeaders(ClickHouseHttpProto.HEADER_DB_PASSWORD);
+        }
+
         correctUserAgentHeader(req, requestConfig);
     }
 
@@ -761,7 +1418,12 @@ public class HttpAPIClientHelper {
             return defaultValue;
         }
 
-        return converter.apply(header.getValue());
+        try {
+            return converter.apply(header.getValue());
+        } catch (RuntimeException e) {
+            LOG.debug("Failed to parse header value '{}': {}", header.getValue(), e.getMessage());
+            return defaultValue;
+        }
     }
 
     public boolean shouldRetry(Throwable ex, Map<String, Object> requestSettings) {
@@ -890,6 +1552,21 @@ public class HttpAPIClientHelper {
 
     public void close() {
         httpClient.close(CloseMode.IMMEDIATE);
+
+        // Close async client with graceful shutdown if it was initialized
+        if (httpAsyncClient != null && asyncClientClosed.compareAndSet(false, true)) {
+            try {
+                httpAsyncClient.close(CloseMode.GRACEFUL);
+                LOG.debug("Async HTTP client closed gracefully");
+            } catch (Exception e) {
+                LOG.warn("Failed to close async HTTP client gracefully, forcing immediate close", e);
+                try {
+                    httpAsyncClient.close(CloseMode.IMMEDIATE);
+                } catch (Exception e2) {
+                    LOG.error("Failed to close async HTTP client", e2);
+                }
+            }
+        }
     }
 
     private static <T> void setHeader(HttpRequest req, String headerName,

@@ -32,6 +32,7 @@ Historically, there are two versions of both components. The previous version of
 | Name                                         | Client V2 | Client V1 | Comments
 |----------------------------------------------|:---------:|:---------:|:---------:|
 | Http Connection                              |✔       |✔      | |
+| Async HTTP (NIO)                             |✔       |✗      | Non-blocking I/O for high concurrency |
 | Http Compression (LZ4)                       |✔       |✔      | |
 | Server Response Compression - LZ4            |✔       |✔      | | 
 | Client Request Compression - LZ4             |✔       |✔      | |
@@ -89,8 +90,36 @@ Nightly Builds: https://s01.oss.sonatype.org/content/repositories/snapshots/com/
 
 [Begin-with Usage Examples](../../tree/main/examples/client-v2)
 
-[Spring Demo Service](https://github.com/ClickHouse/clickhouse-java/tree/main/examples/demo-service) 
+[Spring Demo Service](https://github.com/ClickHouse/clickhouse-java/tree/main/examples/demo-service)
 
+### Async HTTP Support
+
+Client V2 supports true async HTTP using Apache HttpClient 5 NIO API for high-concurrency workloads.
+
+**Features:**
+- Non-blocking I/O - no thread-per-request blocking
+- Streaming responses with constant memory usage
+- Streaming request compression (HTTP and native LZ4)
+- Substantial reduction in thread usage under high concurrency
+
+**Usage:**
+```java
+Client client = new Client.Builder()
+    .addEndpoint("http://localhost:8123")
+    .setUsername("default")
+    .useAsyncHttp(true)  // Enable async HTTP
+    .build();
+
+// Queries and inserts work the same way
+CompletableFuture<QueryResponse> future = client.query("SELECT * FROM table");
+```
+
+**When to use:**
+- High concurrency (100+ concurrent requests)
+- Large result sets or inserts (GB+ data)
+- Memory-constrained environments
+
+Async HTTP is opt-in and disabled by default. Existing code works without changes.
 
 ## JDBC Driver
 

@@ -18,6 +18,7 @@ import com.clickhouse.client.api.insert.InsertSettings;
 import com.clickhouse.client.api.internal.ClientStatisticsHolder;
 import com.clickhouse.client.api.internal.HttpAPIClientHelper;
 import com.clickhouse.client.api.internal.MapUtils;
+import com.clickhouse.client.api.internal.StreamingAsyncEntityProducer;
 import com.clickhouse.client.api.internal.TableSchemaParser;
 import com.clickhouse.client.api.internal.ValidationUtils;
 import com.clickhouse.client.api.metadata.ColumnToMethodMatchingStrategy;
@@ -113,7 +114,63 @@ import java.util.stream.Collectors;
 public class Client implements AutoCloseable {
     private static final Logger LOG = LoggerFactory.getLogger(Client.class);
 
+    /**
+     * Shared scheduler for async operation timeouts (Java 8 compatible alternative to orTimeout).
+     * Uses daemon threads as a fallback so it won't prevent JVM shutdown if not properly released.
+     *
+     * <p>Lifecycle management: The scheduler is lazily created when the first async client is created
+     * and shut down when the last async client is closed. This ensures graceful resource cleanup.</p>
+     */
+    private static final Object TIMEOUT_SCHEDULER_LOCK = new Object();
+    private static final java.util.concurrent.atomic.AtomicInteger TIMEOUT_SCHEDULER_REF_COUNT =
+            new java.util.concurrent.atomic.AtomicInteger(0);
+    private static volatile java.util.concurrent.ScheduledExecutorService timeoutScheduler = null;
+
+    /**
+     * Thread-safety: Synchronizes on TIMEOUT_SCHEDULER_LOCK, ensuring mutual exclusion
+     * with releaseTimeoutScheduler(). No race condition exists because threads cannot
+     * concurrently execute acquire and release.
+     */
+    private static void acquireTimeoutScheduler() {
+        synchronized (TIMEOUT_SCHEDULER_LOCK) {
+            if (TIMEOUT_SCHEDULER_REF_COUNT.getAndIncrement() == 0) {
+                timeoutScheduler = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+                    Thread t = new Thread(r, "ch-async-timeout");
+                    t.setDaemon(true);
+                    return t;
+                });
+                LOG.debug("Created async timeout scheduler");
+            }
+        }
+    }
+
+    /**
+     * Thread-safety: Synchronizes on TIMEOUT_SCHEDULER_LOCK, ensuring mutual exclusion
+     * with acquireTimeoutScheduler(). The synchronized block guarantees that between
+     * checking the ref count and shutting down, no other thread can acquire a new reference.
+     */
+    private static void releaseTimeoutScheduler() {
+        synchronized (TIMEOUT_SCHEDULER_LOCK) {
+            if (TIMEOUT_SCHEDULER_REF_COUNT.decrementAndGet() == 0 && timeoutScheduler != null) {
+                LOG.debug("Shutting down async timeout scheduler");
+                timeoutScheduler.shutdown();
+                try {
+                    if (!timeoutScheduler.awaitTermination(5, TimeUnit.SECONDS)) {
+                        timeoutScheduler.shutdownNow();
+                    }
+                } catch (InterruptedException e) {
+                    timeoutScheduler.shutdownNow();
+                    Thread.currentThread().interrupt();
+                }
+                timeoutScheduler = null;
+            }
+        }
+    }
+
     private HttpAPIClientHelper httpClientHelper = null;
+
+    /** Tracks whether this client instance uses async HTTP (for proper executor cleanup) */
+    private final boolean usesAsyncHttp;
 
     private final List<Endpoint> endpoints;
     private final Map<String, Object> configuration;
@@ -195,6 +252,29 @@ public class Client implements AutoCloseable {
         this.serverVersion = configuration.getOrDefault(ClientConfigProperties.SERVER_VERSION.getKey(), "unknown");
         this.dbUser = configuration.getOrDefault(ClientConfigProperties.USER.getKey(), ClientConfigProperties.USER.getDefObjVal());
         this.typeHintMapping = (Map<ClickHouseDataType, Class<?>>) this.configuration.get(ClientConfigProperties.TYPE_HINT_MAPPING.getKey());
+
+        // Acquire shared async resources if async HTTP is enabled
+        this.usesAsyncHttp = httpClientHelper.isAsyncEnabled();
+        if (this.usesAsyncHttp) {
+            boolean timeoutSchedulerAcquired = false;
+            try {
+                acquireTimeoutScheduler();
+                timeoutSchedulerAcquired = true;
+                StreamingAsyncEntityProducer.acquireExecutor();
+            } catch (Exception e) {
+                // Release any acquired resources on failure to prevent leaks
+                if (timeoutSchedulerAcquired) {
+                    releaseTimeoutScheduler();
+                }
+                // Ensure HTTP client helper is also closed on initialization failure
+                try {
+                    httpClientHelper.close();
+                } catch (Exception closeEx) {
+                    // Ignore to avoid masking the original initialization failure
+                }
+                throw e;
+            }
+        }
     }
 
     /**
@@ -232,6 +312,10 @@ public class Client implements AutoCloseable {
      * Frees the resources associated with the client.
      * <ul>
      *     <li>Shuts down the shared operation executor by calling {@code shutdownNow()}</li>
+     *     <li>Closes the HTTP client helper</li>
+     *     <li>Releases shared async resources (compression executor, timeout scheduler) if this
+     *         client was using async HTTP. When the last async client is closed, these shared
+     *         resources are gracefully shut down.</li>
      * </ul>
      */
     @Override
@@ -250,6 +334,12 @@ public class Client implements AutoCloseable {
 
         if (httpClientHelper != null) {
             httpClientHelper.close();
+        }
+
+        // Release shared async resources if this client was using them
+        if (usesAsyncHttp) {
+            StreamingAsyncEntityProducer.releaseExecutor();
+            releaseTimeoutScheduler();
         }
     }
 
@@ -821,6 +911,32 @@ public class Client implements AutoCloseable {
          */
         public Builder useAsyncRequests(boolean async) {
             this.configuration.put(ClientConfigProperties.ASYNC_OPERATIONS.getKey(), String.valueOf(async));
+            return this;
+        }
+
+        /**
+         * Enables true async HTTP transport using Apache HttpClient 5 async API.
+         * When enabled, HTTP requests use NIO-based non-blocking I/O instead of
+         * blocking thread-per-request model. This provides better scalability
+         * under high concurrency without requiring thread pools.
+         *
+         * <p>Features:</p>
+         * <ul>
+         *   <li>Response bodies are streamed through a pipe, avoiding memory buffering</li>
+         *   <li>LZ4 request compression is supported ({@code compressClientRequest})</li>
+         *   <li>Suitable for large result sets and high-concurrency workloads</li>
+         * </ul>
+         *
+         * <p><b>Current Limitations:</b></p>
+         * <ul>
+         *   <li><b>MULTIPART:</b> Multipart requests use sync fallback path.</li>
+         * </ul>
+         *
+         * @param useAsyncHttp - true to enable async HTTP transport
+         * @return this builder
+         */
+        public Builder useAsyncHttp(boolean useAsyncHttp) {
+            this.configuration.put(ClientConfigProperties.USE_ASYNC_HTTP.getKey(), String.valueOf(useAsyncHttp));
             return this;
         }
 
@@ -1424,6 +1540,12 @@ public class Client implements AutoCloseable {
             throw new IllegalArgumentException("Buffer size must be greater than 0");
         }
 
+        // Use async path for InputStream-based inserts when async is enabled
+        if (httpClientHelper.isAsyncEnabled()) {
+            CompletableFuture<InsertResponse> future = executeInsertAsync(tableName, columnNames, data, format, settings);
+            return applyAsyncTimeout(future, settings.getNetworkTimeout());
+        }
+
         return insert(tableName, columnNames, new DataStreamWriter() {
                     @Override
                     public void onOutput(OutputStream out) throws IOException {
@@ -1441,6 +1563,85 @@ public class Client implements AutoCloseable {
                     }
                 },
                 format, settings);
+    }
+
+    /**
+     * Executes an async insert operation using the async HTTP client.
+     *
+     * <p><b>IMPORTANT:</b> Unlike the synchronous insert path, this async implementation
+     * does NOT support automatic retry on 503 Service Unavailable responses. The synchronous
+     * path retries on 503 and retryable failures (invoking onRetry()/data.reset()), but
+     * async inserts with InputStreams cannot reliably support retry because streams are
+     * not always resettable.</p>
+     *
+     * <p>If you require retry semantics for insert operations, use the synchronous client
+     * (set useAsyncHttp(false)) or implement retry logic in your application code with
+     * a resettable data source.</p>
+     */
+    private CompletableFuture<InsertResponse> executeInsertAsync(String tableName,
+                                                                  List<String> columnNames,
+                                                                  InputStream data,
+                                                                  ClickHouseFormat format,
+                                                                  InsertSettings settings) {
+        final InsertSettings requestSettings = new InsertSettings(buildRequestSettings(settings.getAllSettings()));
+        requestSettings.setOption(ClientConfigProperties.INPUT_OUTPUT_FORMAT.getKey(), format);
+
+        String operationId = requestSettings.getOperationId();
+        ClientStatisticsHolder clientStats = operationId != null ? globalClientStats.remove(operationId) : null;
+        if (clientStats == null) {
+            clientStats = new ClientStatisticsHolder();
+        }
+        clientStats.start(ClientMetrics.OP_DURATION);
+        final ClientStatisticsHolder finalClientStats = clientStats;
+
+        // Build INSERT statement
+        StringBuilder sqlStmt = new StringBuilder("INSERT INTO ").append(tableName);
+        if (columnNames != null && !columnNames.isEmpty()) {
+            sqlStmt.append(" (");
+            for (String columnName : columnNames) {
+                sqlStmt.append(columnName).append(", ");
+            }
+            sqlStmt.setLength(sqlStmt.length() - 2);
+            sqlStmt.append(")");
+        }
+        sqlStmt.append(" FORMAT ").append(format.name());
+        requestSettings.serverSetting(ClickHouseHttpProto.QPARAM_QUERY_STMT, sqlStmt.toString());
+
+        if (requestSettings.getQueryId() == null && queryIdGenerator != null) {
+            requestSettings.setQueryId(queryIdGenerator.get());
+        }
+
+        final Endpoint selectedEndpoint = getNextAliveNode();
+
+        return httpClientHelper.executeInsertAsyncStreaming(selectedEndpoint, requestSettings.getAllSettings(), data)
+                .thenApply(response -> {
+                    try {
+                        // Check for 503 Service Unavailable - async inserts don't support retry
+                        if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                            throw new java.util.concurrent.CompletionException(
+                                    new ServerException(ServerException.CODE_UNKNOWN,
+                                            "Service Unavailable - async inserts do not support automatic retry",
+                                            HttpStatus.SC_SERVICE_UNAVAILABLE, requestSettings.getQueryId()));
+                        }
+
+                        OperationMetrics metrics = new OperationMetrics(finalClientStats);
+                        String summary = HttpAPIClientHelper.getHeaderVal(
+                                response.getFirstHeader(ClickHouseHttpProto.HEADER_SRV_SUMMARY), "{}");
+                        ProcessParser.parseSummary(summary, metrics);
+                        String queryId = HttpAPIClientHelper.getHeaderVal(
+                                response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID), requestSettings.getQueryId());
+                        metrics.setQueryId(queryId);
+                        metrics.operationComplete();
+
+                        return new InsertResponse(metrics);
+                    } finally {
+                        try {
+                            response.close();
+                        } catch (IOException e) {
+                            LOG.debug("Error closing insert response", e);
+                        }
+                    }
+                });
     }
 
     /**
@@ -1508,7 +1709,7 @@ public class Client implements AutoCloseable {
             for (String columnName : columnNames) {
                 sqlStmt.append(columnName).append(", ");
             }
-            sqlStmt.deleteCharAt(sqlStmt.length() - 2);
+            sqlStmt.setLength(sqlStmt.length() - 2);
             sqlStmt.append(")");
         }
         sqlStmt.append(" FORMAT ").append(format.name());
@@ -1645,6 +1846,14 @@ public class Client implements AutoCloseable {
             requestSettings.setQueryId(queryIdGenerator.get());
         }
 
+        boolean useAsyncHttp = httpClientHelper.isAsyncEnabled();
+        boolean useMultipart = ClientConfigProperties.HTTP_SEND_PARAMS_IN_BODY.getOrDefault(requestSettings.getAllSettings());
+
+        if (useAsyncHttp && !(queryParams != null && useMultipart)) { // multipart not yet supported in async
+            CompletableFuture<QueryResponse> future = executeQueryAsync(sqlQuery, requestSettings, clientStats, 0);
+            return applyAsyncTimeout(future, requestSettings.getNetworkTimeout());
+        }
+
         Supplier<QueryResponse> responseSupplier = () -> {
                 long startTime = System.nanoTime();
                 // Selecting some node
@@ -1653,7 +1862,6 @@ public class Client implements AutoCloseable {
                 for (int i = 0; i <= retries; i++) {
                     ClassicHttpResponse httpResponse = null;
                     try {
-                        boolean  useMultipart = ClientConfigProperties.HTTP_SEND_PARAMS_IN_BODY.getOrDefault(requestSettings.getAllSettings());
                         if (queryParams != null && useMultipart) {
                             httpResponse = httpClientHelper.executeMultiPartRequest(selectedEndpoint,
                                     requestSettings.getAllSettings(), sqlQuery);
@@ -1705,6 +1913,147 @@ public class Client implements AutoCloseable {
 
         return runAsyncOperation(responseSupplier, requestSettings.getAllSettings());
     }
+
+    private CompletableFuture<QueryResponse> executeQueryAsync(String sqlQuery,
+                                                               QuerySettings requestSettings,
+                                                               ClientStatisticsHolder clientStats,
+                                                               int attempt) {
+        final long startTime = System.nanoTime();
+        final Endpoint selectedEndpoint = getNextAliveNode();
+
+        return httpClientHelper.executeRequestAsyncStreaming(selectedEndpoint, requestSettings.getAllSettings(), sqlQuery)
+                .handle((response, ex) -> {
+                    if (ex != null) {
+                        Throwable cause = ex instanceof java.util.concurrent.CompletionException ? ex.getCause() : ex;
+                        String msg = requestExMsg("Query", (attempt + 1), durationSince(startTime).toMillis(), requestSettings.getQueryId());
+                        RuntimeException wrappedException = (cause instanceof Exception)
+                                ? httpClientHelper.wrapException(msg, (Exception) cause, requestSettings.getQueryId())
+                                : new RuntimeException(msg, cause);
+
+                        if (httpClientHelper.shouldRetry(cause, requestSettings.getAllSettings()) && attempt < retries) {
+                            LOG.warn("Async query failed, retrying (attempt {}): {}", attempt + 1, cause.getMessage());
+                            return new AsyncRetryMarker(attempt + 1);
+                        }
+                        throw new java.util.concurrent.CompletionException(wrappedException);
+                    }
+
+                    if (response.getCode() == HttpStatus.SC_SERVICE_UNAVAILABLE) {
+                        if (attempt < retries) {
+                            LOG.warn("Failed to get response. Server returned {}. Retrying. (Duration: {})",
+                                    response.getCode(), durationSince(startTime));
+                            // Close the streaming response before retrying to avoid resource leaks
+                            try {
+                                response.close();
+                            } catch (Exception closeEx) {
+                                LOG.debug("Failed to close streaming response before retry", closeEx);
+                            }
+                            return new AsyncRetryMarker(attempt + 1);
+                        } else {
+                            String msg = requestExMsg("Query", (attempt + 1),
+                                    durationSince(startTime).toMillis(), requestSettings.getQueryId());
+                            IOException cause = new IOException("Failed to get response. Server returned HTTP 503 (Service Unavailable).");
+                            RuntimeException wrappedException = httpClientHelper.wrapException(
+                                    msg, cause, requestSettings.getQueryId());
+                            // Close the streaming response before completing exceptionally
+                            try {
+                                response.close();
+                            } catch (Exception closeEx) {
+                                LOG.debug("Failed to close streaming response after retries exhausted", closeEx);
+                            }
+                            throw new java.util.concurrent.CompletionException(wrappedException);
+                        }
+                    }
+
+                    OperationMetrics metrics = new OperationMetrics(clientStats);
+                    String summary = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_SRV_SUMMARY), "{}");
+                    ProcessParser.parseSummary(summary, metrics);
+                    String queryId = HttpAPIClientHelper.getHeaderVal(
+                            response.getFirstHeader(ClickHouseHttpProto.HEADER_QUERY_ID), requestSettings.getQueryId());
+                    metrics.setQueryId(queryId);
+                    metrics.operationComplete();
+
+                    Header formatHeader = response.getFirstHeader(ClickHouseHttpProto.HEADER_FORMAT);
+                    ClickHouseFormat responseFormat = requestSettings.getFormat();
+                    if (formatHeader != null) {
+                        responseFormat = ClickHouseFormat.valueOf(formatHeader.getValue());
+                    }
+
+                    return new QueryResponse(response, responseFormat, requestSettings, metrics);
+                })
+                .thenCompose(result -> {
+                    if (result instanceof AsyncRetryMarker) {
+                        return executeQueryAsync(sqlQuery, requestSettings, clientStats, ((AsyncRetryMarker) result).nextAttempt);
+                    }
+                    return CompletableFuture.completedFuture((QueryResponse) result);
+                });
+    }
+
+    /** Marker to signal async retry without blocking .join() calls */
+    private static class AsyncRetryMarker {
+        final int nextAttempt;
+        AsyncRetryMarker(int nextAttempt) {
+            this.nextAttempt = nextAttempt;
+        }
+    }
+
+    /**
+     * Applies a timeout to an async operation if configured.
+     * If timeout is 0 or negative, returns the original future unchanged.
+     * Java 8 compatible implementation (orTimeout requires Java 9+).
+     *
+     * @param future the future to wrap with timeout
+     * @param timeoutMs timeout in milliseconds (0 or negative means no timeout)
+     * @return future with timeout applied, or original future if no timeout
+     */
+    private <T> CompletableFuture<T> applyAsyncTimeout(CompletableFuture<T> future, long timeoutMs) {
+        if (timeoutMs <= 0) {
+            return future;
+        }
+        // Java 8 compatible timeout implementation using shared scheduler
+        java.util.concurrent.ScheduledExecutorService scheduler = timeoutScheduler;
+        if (scheduler == null || scheduler.isShutdown()) {
+            LOG.warn("Timeout scheduler not available - timeout will not be applied");
+            return future;
+        }
+
+        // Wrapper future that enforces timeout and propagates cancellation
+        CompletableFuture<T> resultFuture = new CompletableFuture<>();
+
+        java.util.concurrent.ScheduledFuture<?> scheduled = scheduler.schedule(() -> {
+            if (resultFuture.isDone()) {
+                return;
+            }
+            // Complete the wrapper with a timeout and cancel the underlying operation
+            TimeoutException timeoutException =
+                    new TimeoutException("Async operation timed out after " + timeoutMs + "ms");
+            resultFuture.completeExceptionally(timeoutException);
+            future.cancel(true);
+        }, timeoutMs, TimeUnit.MILLISECONDS);
+
+        // When the underlying future completes first, propagate its result and cancel the timeout task
+        future.whenComplete((value, ex) -> {
+            if (resultFuture.isDone()) {
+                return;
+            }
+            scheduled.cancel(false);
+            if (ex != null) {
+                resultFuture.completeExceptionally(ex);
+            } else {
+                resultFuture.complete(value);
+            }
+        });
+
+        // If callers cancel the wrapper, propagate cancellation to the underlying future
+        resultFuture.whenComplete((v, ex) -> {
+            if (resultFuture.isCancelled() && !future.isDone()) {
+                future.cancel(true);
+            }
+        });
+
+        return resultFuture;
+    }
+
     public CompletableFuture<QueryResponse> query(String sqlQuery, Map<String, Object> queryParams) {
         return query(sqlQuery, queryParams, null);
     }

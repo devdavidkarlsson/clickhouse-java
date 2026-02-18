@@ -7,6 +7,7 @@ import io.micrometer.core.instrument.MeterRegistry;
 import io.micrometer.core.instrument.Tag;
 import io.micrometer.core.instrument.Tags;
 import org.apache.hc.client5.http.impl.io.PoolingHttpClientConnectionManager;
+import org.apache.hc.client5.http.impl.nio.PoolingAsyncClientConnectionManager;
 import org.apache.hc.core5.pool.ConnPoolControl;
 
 public class MicrometerLoader {
@@ -58,6 +59,50 @@ public class MicrometerLoader {
                     .description("The running average connection creation time.")
                     .tag("httpclient", metricsGroupName)
                     .register((MeterRegistry) registry);
+        } else {
+            throw new ClientMisconfigurationException("Unsupported registry type." + registry.getClass());
+        }
+    }
+
+    /**
+     * Registers Micrometer metrics for the async HTTP client connection pool.
+     */
+    public static void applyAsyncPoolingMetricsBinder(Object registry, String metricsGroupName, PoolingAsyncClientConnectionManager pacm) {
+        if (registry instanceof MeterRegistry) {
+            Iterable<Tag> tags = Tags.of("httpclient", metricsGroupName + "-async");
+            Gauge
+                    .builder("httpcomponents.httpclient.pool.total.max", pacm,
+                            (connPoolControl) -> connPoolControl.getTotalStats().getMax())
+                    .description("The configured maximum number of allowed persistent connections for all routes (async).")
+                    .tags(tags)
+                    .register((MeterRegistry) registry);
+            Gauge
+                    .builder("httpcomponents.httpclient.pool.total.connections", pacm,
+                            (connPoolControl) -> connPoolControl.getTotalStats().getAvailable())
+                    .description("The number of persistent and available connections for all routes (async).")
+                    .tags(tags)
+                    .tag("state", "available")
+                    .register((MeterRegistry) registry);
+            Gauge
+                    .builder("httpcomponents.httpclient.pool.total.connections", pacm,
+                            (connPoolControl) -> connPoolControl.getTotalStats().getLeased())
+                    .description("The number of persistent and leased connections for all routes (async).")
+                    .tags(tags)
+                    .tag("state", "leased")
+                    .register((MeterRegistry) registry);
+            Gauge
+                    .builder("httpcomponents.httpclient.pool.total.pending", pacm,
+                            (connPoolControl) -> connPoolControl.getTotalStats().getPending())
+                    .description("The number of connection requests being blocked awaiting a free connection for all routes (async).")
+                    .tags(tags)
+                    .register((MeterRegistry) registry);
+            Gauge
+                    .builder("httpcomponents.httpclient.pool.route.max.default", pacm,
+                            ConnPoolControl::getDefaultMaxPerRoute)
+                    .description("The configured default maximum number of allowed persistent connections per route (async).")
+                    .tags(tags)
+                    .register((MeterRegistry) registry);
+
         } else {
             throw new ClientMisconfigurationException("Unsupported registry type." + registry.getClass());
         }

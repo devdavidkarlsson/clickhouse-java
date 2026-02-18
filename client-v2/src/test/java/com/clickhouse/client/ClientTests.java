@@ -260,7 +260,7 @@ public class ClientTests extends BaseIntegrationTest {
                     Assert.assertEquals(config.get(p.getKey()), p.getDefaultValue(), "Default value doesn't match");
                 }
             }
-            Assert.assertEquals(config.size(), 34); // to check everything is set. Increment when new added.
+            Assert.assertEquals(config.size(), 35); // to check everything is set. Increment when new added.
         }
 
         try (Client client = new Client.Builder()
@@ -360,7 +360,7 @@ public class ClientTests extends BaseIntegrationTest {
                     Assert.assertEquals(config.get(p.getKey()), p.getDefaultValue(), "Default value doesn't match");
                 }
             }
-            Assert.assertEquals(config.size(), 34); // to check everything is set. Increment when new added.
+            Assert.assertEquals(config.size(), 35); // to check everything is set. Increment when new added.
         }
     }
 
