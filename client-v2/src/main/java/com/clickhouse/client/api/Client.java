@@ -266,6 +266,12 @@ public class Client implements AutoCloseable {
                 if (timeoutSchedulerAcquired) {
                     releaseTimeoutScheduler();
                 }
+                // Ensure HTTP client helper is also closed on initialization failure
+                try {
+                    httpClientHelper.close();
+                } catch (Exception closeEx) {
+                    // Ignore to avoid masking the original initialization failure
+                }
                 throw e;
             }
         }
